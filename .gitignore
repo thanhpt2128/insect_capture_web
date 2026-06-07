@@ -138,3 +138,15 @@ dmypy.json
 cython_debug/
 
 .vscode/
+
+# Python virtual env
+.venv/
+
+# Folder parse data
+data_parse/
+
+# Matlab examples
+matlabExample/
+
+# VSCode workspace file
+*.code-workspace
