@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>pyRadar Web</title>
+	<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+	<div class="shell">
+		<header class="hero">
+			<h1>pyRadar Web</h1>
+			<div class="status" id="systemStatus">nhàn rỗi</div>
+		</header>
+
+		<section class="grid">
+			<section class="card">
+				<h2>Cổng COM</h2>
+				<div class="row">
+					<select id="comPortSelect"></select>
+					<button id="comRescan" type="button">Quét lại</button>
+				</div>
+				<div class="hint" id="comMessage">Chưa quét.</div>
+			</section>
+
+			<section class="card">
+				<h2>File cấu hình (.cfg)</h2>
+				<div class="row">
+					<select id="cfgSelect"></select>
+					<button id="cfgReload" type="button">Tải lại</button>
+				</div>
+				<div class="row">
+					<input id="cfgPath" type="text" placeholder="Đường dẫn tuyệt đối hoặc tên file trong configFiles/" />
+					<button id="cfgMetrics" type="button">Radar metrics</button>
+				</div>
+				<pre class="pre" id="metricsOut">{}</pre>
+				<div class="hint" id="cfgMessage">Sẵn sàng.</div>
+			</section>
+
+			<section class="card">
+				<h2>Real-time</h2>
+				<div class="row">
+					<button id="rtStart" type="button">Bắt đầu</button>
+					<button id="rtStop" type="button">Dừng</button>
+					<button id="rtStatus" type="button">Trạng thái</button>
+				</div>
+				<div class="hint" id="rtMessage">Nhàn rỗi.</div>
+				<pre class="pre" id="resultOut"></pre>
+			</section>
+		</section>
+	</div>
+
+	<script src="/static/app.js"></script>
+</body>
+</html>

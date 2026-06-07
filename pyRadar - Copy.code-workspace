@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../studiocli_web"
+		},
+		{
+			"path": "../Real-Time-Raw-ADC-Data-Capture-and-Processing-Tool-for-Texas-Instruments-mmWave-Radar-in-Python"
+		},
+		{
+			"path": "../xwr"
+		}
+	],
+	"settings": {}
+}
