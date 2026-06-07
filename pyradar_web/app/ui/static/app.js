@@ -208,7 +208,7 @@ function wireUi() {
 }
 
 (async () => {
-	setStatus("nhàn rỗi");
+	setStatus("Idle");
 	wireUi();
 	await loadComPorts();
 	await loadCfgFiles();
