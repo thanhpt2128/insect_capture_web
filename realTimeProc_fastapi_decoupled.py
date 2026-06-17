@@ -154,7 +154,7 @@ def capture_worker_process(
         try:
             dca.reset_radar()
             dca.reset_fpga()
-            time.sleep(5.0)
+            time.sleep(7.0)
         except Exception as exc:
             print(f"[-] Failed to reset DCA1000: {exc}", flush=True)
             raise

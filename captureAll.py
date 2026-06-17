@@ -60,7 +60,7 @@ try:
     # 2. 通过UART初始化雷达并配置相应参数
     dca_config_file = "configFiles/cf.json" # 记得将cf.json中的lvdsMode设为2，xWR1843只支持2路LVDS lanes
     radar_config_file = "configFiles/cfg128_128_100fps.cfg" # 记得将lvdsStreamCfg的第三个参数设置为1开启LVDS数据传输
-    numframes=10
+    numframes=500
     # 记得改端口号,verbose=True会显示向毫米波雷达板子发送的所有串口指令及响应
     radar = TI(cli_loc='COM5',cli_baud=921600, data_loc='COM3',data_baud=921600,config_file=radar_config_file,verbose=True)
     # radar设置frame个数后会自动停止，无需向FPGA发送停止命令，但仍需向radar发送停止命令

@@ -76,7 +76,7 @@ def run_hardware(
     cfg_path: str,
     cli_baud: int,
     dca_json_path: str,
-    numframes: int = 2,
+    numframes: int = 10,
     frame_num_in_buf: int = 128,
     interval: float = 0.0,
 ) -> None:
