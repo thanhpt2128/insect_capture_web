@@ -110,7 +110,7 @@ class RealTimeController:
 
         return self.status()
 
-    def stop(self, timeout_seconds: int = 5) -> Dict[str, object]:
+    def stop(self, timeout_seconds: int = 10) -> Dict[str, object]:
         with self._lock:
             process = self._process
             if process is None or process.poll() is not None:

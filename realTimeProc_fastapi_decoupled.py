@@ -1,6 +1,7 @@
 import argparse
 import json
 import multiprocessing
+import select
 import signal
 import socket
 import sys
@@ -71,6 +72,35 @@ def _send_json_line(sock: socket.socket, data: Dict[str, Any]) -> None:
     """Serialize and transmit newline-delimited JSON over the socket."""
     line = json.dumps(_to_builtin(data), ensure_ascii=False) + "\n"
     sock.sendall(line.encode("utf-8"))
+
+
+def _recv_control_messages(
+    sock: socket.socket, buffer: bytes
+) -> tuple[bytes, List[Dict[str, Any]]]:
+    """Read newline-delimited control JSON messages from the FastAPI socket."""
+    messages: List[Dict[str, Any]] = []
+    chunk = sock.recv(4096)
+    if not chunk:
+        raise ConnectionError("control socket closed")
+
+    buffer += chunk
+    while b"\n" in buffer:
+        line, buffer = buffer.split(b"\n", 1)
+        payload = line.strip()
+        if not payload:
+            continue
+
+        try:
+            messages.append(json.loads(payload.decode("utf-8", errors="replace")))
+        except Exception:
+            messages.append(
+                {
+                    "cmd": "unknown",
+                    "raw": payload.decode("utf-8", errors="replace"),
+                }
+            )
+
+    return buffer, messages
 
 
 def _resolve_repo_path(path_raw: str, default_dir: str = "") -> str:
@@ -304,6 +334,7 @@ def ai_worker_process(
     print("[+] AI Worker Process initiated.", flush=True)
 
     sock = None
+    recv_buffer = b""
     try:
         sock = socket.create_connection(
             (args_dict["server_host"], int(args_dict["server_port"])),
@@ -321,6 +352,34 @@ def ai_worker_process(
 
     try:
         while not exit_event.is_set():
+            readable, _, _ = select.select([sock], [], [], 0)
+            if readable:
+                try:
+                    recv_buffer, messages = _recv_control_messages(sock, recv_buffer)
+                except Exception as exc:
+                    print(
+                        f"[!] Control socket closed or invalid: {exc}. Initiating teardown...",
+                        flush=True,
+                    )
+                    exit_event.set()
+                    break
+
+                for message in messages:
+                    if str(message.get("cmd", "")).lower() == "stop":
+                        print("[*] Stop command received from FastAPI controller.", flush=True)
+                        try:
+                            _send_json_line(
+                                sock,
+                                {"type": "status", "event": "stopping", "ts": time.time()},
+                            )
+                        except Exception:
+                            pass
+                        exit_event.set()
+                        break
+
+            if exit_event.is_set():
+                break
+
             try:
                 seq, ts, features = ai_queue.get(block=True, timeout=1.0)
             except Empty:
