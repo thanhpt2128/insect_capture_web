@@ -21,11 +21,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 import paho.mqtt.client as mqtt
 
 
-DEFAULT_BIN = Path(r"E:\DATN\30_5_ong\ongx7\30_5_ongx7_65cm_lan1_Raw_0.bin")
+DEFAULT_BIN = Path(r"E:\DATN\clone_code\pyRadar - Copy\data_parse\nguoidunglenngoixuong.bin")
 
 # Hard-coded from ../dsp_radar/test_ve_pho_raw_data.ipynb.
 NOTEBOOK_NUM_TX = 1
@@ -79,6 +80,7 @@ class PublisherConfig:
     publish_config_each_frame: bool = True
     clutter_removal: bool = True
     clutter_alpha: float = 0.95
+    offline_history: int = 200
 
 
 def notebook_radar_config() -> RadarConfig:
@@ -350,37 +352,94 @@ def compute_range_profile(
 def build_payload(
     frame_id: int,
     range_profile: np.ndarray,
-    radar_cfg: RadarConfig,
-    fft_size: int,
-    include_config: bool,
 ) -> dict:
+    bin_indices = list(range(int(range_profile.size)))
     values = {
         "frame_id": frame_id,
-        "bins": int(range_profile.size),
+        "bin": bin_indices,
         "range_profile": [round(float(v), 3) for v in range_profile.tolist()],
     }
 
-    resolution = range_resolution_m(radar_cfg)
-    max_range = max_range_m(radar_cfg)
-    if include_config:
-        values.update(
-            {
-                "fft_size": int(fft_size),
-                "adc_samples": int(radar_cfg.samples),
-                "chirps": int(radar_cfg.chirps),
-                "tx": int(radar_cfg.tx),
-                "rx": int(radar_cfg.rx),
-            }
-        )
-        if resolution is not None:
-            values["range_resolution_m"] = round(float(resolution), 6)
-            values["display_max_range_m"] = round(
-                float(resolution * range_profile.size), 6
-            )
-        if max_range is not None:
-            values["max_range_m"] = round(float(max_range), 6)
-
     return {"ts": int(time.time() * 1000), "values": values}
+
+
+class OfflineRangeViewer:
+    """Lightweight local viewer for dry-run range-profile replay."""
+
+    def __init__(self, num_bins: int, history_size: int) -> None:
+        self.num_bins = num_bins
+        self.history_size = max(10, history_size)
+        self.history = np.full((self.history_size, num_bins), np.nan, dtype=np.float32)
+
+        plt.ion()
+        self.fig, (self.ax_profile, self.ax_heatmap) = plt.subplots(
+            2,
+            1,
+            figsize=(10, 7),
+            gridspec_kw={"height_ratios": [1, 2]},
+        )
+        self.fig.canvas.manager.set_window_title("AWR1843 Dry Run Viewer")
+
+        bins = np.arange(num_bins, dtype=np.int32)
+        self.profile_line, = self.ax_profile.plot(bins, np.zeros(num_bins, dtype=np.float32))
+        self.ax_profile.set_title("Current Range Profile")
+        self.ax_profile.set_xlabel("Range Bin")
+        self.ax_profile.set_ylabel("Amplitude (dB)")
+        self.ax_profile.grid(True, alpha=0.3)
+
+        self.heatmap = self.ax_heatmap.imshow(
+            self.history.T,
+            aspect="auto",
+            origin="lower",
+            cmap="viridis",
+            interpolation="nearest",
+        )
+        self.ax_heatmap.set_title("Range-Time Waterfall")
+        self.ax_heatmap.set_xlabel("Frame History")
+        self.ax_heatmap.set_ylabel("Range Bin")
+        self.colorbar = self.fig.colorbar(self.heatmap, ax=self.ax_heatmap)
+        self.colorbar.set_label("Amplitude (dB)")
+
+        self.fig.tight_layout()
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+    def update(self, frame_id: int, range_profile: np.ndarray) -> None:
+        self.history = np.roll(self.history, -1, axis=0)
+        self.history[-1] = range_profile
+
+        self.profile_line.set_ydata(range_profile)
+        self.ax_profile.set_xlim(0, max(self.num_bins - 1, 1))
+
+        profile_min = float(np.min(range_profile))
+        profile_max = float(np.max(range_profile))
+        if profile_min == profile_max:
+            profile_min -= 1.0
+            profile_max += 1.0
+        self.ax_profile.set_ylim(profile_min - 1.0, profile_max + 1.0)
+
+        valid = self.history[np.isfinite(self.history)]
+        if valid.size:
+            vmin = float(np.min(valid))
+            vmax = float(np.max(valid))
+            if vmin == vmax:
+                vmin -= 1.0
+                vmax += 1.0
+            self.heatmap.set_clim(vmin=vmin, vmax=vmax)
+
+        self.heatmap.set_data(self.history.T)
+        self.ax_profile.set_title(f"Current Range Profile - Frame {frame_id}")
+        self.ax_heatmap.set_title(
+            f"Range-Time Waterfall - Last {self.history_size} Frames"
+        )
+
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)
+
+    def close(self) -> None:
+        plt.ioff()
+        plt.close(self.fig)
 
 
 def connect_mqtt(cfg: PublisherConfig) -> mqtt.Client:
@@ -450,6 +509,12 @@ def parse_args() -> PublisherConfig:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--offline-history",
+        type=positive_int,
+        default=defaults.offline_history,
+        help="Dry-run waterfall history length in frames.",
+    )
+    parser.add_argument(
         "--no-clutter-removal",
         action="store_true",
         help="Disable the notebook-style IIR static clutter removal.",
@@ -483,6 +548,7 @@ def parse_args() -> PublisherConfig:
         publish_config_each_frame=not args.config_once,
         clutter_removal=not args.no_clutter_removal,
         clutter_alpha=args.clutter_alpha,
+        offline_history=args.offline_history,
     )
 
 
@@ -525,6 +591,11 @@ def print_startup_summary(
         f"clutter_iir={cfg.clutter_removal}, alpha={cfg.clutter_alpha}"
     )
     print(f"Replay: fps={fps:.3f}, repeat_file={cfg.repeat_file}, dry_run={cfg.dry_run}")
+    if cfg.dry_run:
+        print(
+            f"Offline viewer: history={cfg.offline_history} frames, "
+            "showing local realtime waterfall"
+        )
 
 
 def main() -> None:
@@ -541,6 +612,7 @@ def main() -> None:
     print_startup_summary(cfg, radar_cfg, fft_size, fps)
 
     client: Optional[mqtt.Client] = None
+    viewer: Optional[OfflineRangeViewer] = None
     if not cfg.dry_run:
         if cfg.access_token == "PUT_DEVICE_ACCESS_TOKEN_HERE":
             raise ValueError("Set --access-token or TB_ACCESS_TOKEN before publishing.")
@@ -564,21 +636,19 @@ def main() -> None:
             payload = build_payload(
                 frame_id=frame_id,
                 range_profile=profile,
-                radar_cfg=radar_cfg,
-                fft_size=fft_size,
-                include_config=cfg.publish_config_each_frame or frame_id == 0,
             )
 
             encoded = json.dumps(payload, separators=(",", ":"))
             if cfg.dry_run:
-                preview = {
-                    **payload,
-                    "values": {
-                        **payload["values"],
-                        "range_profile": payload["values"]["range_profile"][:8],
-                    },
-                }
-                print(json.dumps(preview, indent=2))
+                if viewer is None:
+                    viewer = OfflineRangeViewer(
+                        num_bins=profile.size,
+                        history_size=cfg.offline_history,
+                    )
+                    print(
+                        "Dry-run viewer started. Close the window or press Ctrl+C to stop."
+                    )
+                viewer.update(frame_id=frame_id, range_profile=profile)
             else:
                 assert client is not None
                 result = client.publish(cfg.topic, encoded, qos=cfg.qos)
@@ -592,6 +662,8 @@ def main() -> None:
         if client is not None:
             client.loop_stop()
             client.disconnect()
+        if viewer is not None:
+            viewer.close()
 
 
 if __name__ == "__main__":

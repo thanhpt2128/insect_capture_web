@@ -23,7 +23,7 @@ raw int16
 -> Range FFT
 -> giu nua pho dau
 -> mean qua antenna va chirp
--> publish range_profile len ThingsBoard MQTT topic v2/t
+-> publish range_profile len ThingsBoard MQTT topic
 ```
 
 ## 1. Can dien gi
@@ -37,17 +37,16 @@ TB host: dia chi ThingsBoard MQTT broker
 TB port: thuong la 1883
 Device access token: token cua device trong ThingsBoard
 Raw bin path: file .bin can replay
-Radar cfg path: file .cfg dung voi file .bin
+Radar parameters: script hien tai dang hard-code theo notebook
 ```
 
 Mac dinh trong code:
 
 ```python
-DEFAULT_BIN = Path("data_parse/raw_data_50fps.bin")
-DEFAULT_RADAR_CFG = Path("configFiles/cfg128_128_100fps.cfg")
+DEFAULT_BIN = Path(r"E:\DATN\30_5_ong\ongx7\30_5_ongx7_65cm_lan1_Raw_0.bin")
 ```
 
-`cfg128_128_100fps.cfg` khop notebook `test_ve_pho_raw_data.ipynb`:
+Thong so dang khop notebook `test_ve_pho_raw_data.ipynb`:
 
 ```text
 num_tx = 1
@@ -58,21 +57,21 @@ fft_size mac dinh = 128
 range bins publish mac dinh = 64
 ```
 
-Neu file raw cua ban duoc capture bang config khac, phai truyen dung `--radar-cfg`.
+Neu file raw cua ban duoc capture bang config khac, can sua thong so hard-code trong script hoac mo rong parser sau.
 
 ## 2. Cai thu vien
 
 Tu thu muc root repo:
 
 ```powershell
-pip install numpy paho-mqtt
+pip install numpy matplotlib paho-mqtt
 ```
 
 Neu dang dung virtualenv cua project thi kich hoat virtualenv truoc.
 
 ## 3. Verify khong can ThingsBoard
 
-Chay dry-run de kiem tra parser, FFT va payload:
+Chay dry-run de kiem tra parser, FFT va xem waterfall offline realtime:
 
 ```powershell
 python test_thingsboard/awr1843_tb_publisher.py --dry-run --max-frames 2 --no-repeat
@@ -85,25 +84,28 @@ AWR1843 replay config: 128 chirps x 1 TX x 4 RX x 128 samples
 frame=262144 bytes
 Range FFT: fft_size=128, publish_bins=64
 Replay: fps=50.000
+Offline viewer: history=200 frames, showing local realtime waterfall
 ```
 
-Payload se co dang:
+`dry-run` bay gio:
+
+```text
+van doc raw bin
+van tinh FFT va range profile
+khong ket noi MQTT
+khong gui len ThingsBoard
+mo 1 cua so matplotlib de ve line plot + waterfall cuon theo frame
+```
+
+Payload neu publish that se co dang:
 
 ```json
 {
   "ts": 1781725177741,
   "values": {
     "frame_id": 0,
-    "bins": 64,
-    "range_profile": [63.224, 70.22, 73.086],
-    "fft_size": 128,
-    "adc_samples": 128,
-    "chirps": 128,
-    "tx": 1,
-    "rx": 4,
-    "range_resolution_m": 0.057959,
-    "display_max_range_m": 3.709385,
-    "max_range_m": 7.418769
+    "bin": [0, 1, 2, 3, 4, 5],
+    "range_profile": [63.224, 70.22, 73.086, 74.551, 73.104, 69.884]
   }
 }
 ```
@@ -131,14 +133,13 @@ Neu ThingsBoard chay tren server khac:
 python test_thingsboard/awr1843_tb_publisher.py --host YOUR_TB_IP --access-token YOUR_DEVICE_ACCESS_TOKEN
 ```
 
-## 5. Chay voi file raw/config khac
+## 5. Chay voi file raw khac
 
 Vi du:
 
 ```powershell
 python test_thingsboard/awr1843_tb_publisher.py `
   --bin "data_parse/raw_data_50fps.bin" `
-  --radar-cfg "configFiles/cfg128_128_100fps.cfg" `
   --host 127.0.0.1 `
   --access-token YOUR_DEVICE_ACCESS_TOKEN
 ```
@@ -158,16 +159,15 @@ python test_thingsboard/awr1843_tb_publisher.py --fps 20 --host 127.0.0.1 --acce
 ## 6. Cac option quan trong
 
 ```text
---dry-run              In payload ra console, khong ket noi MQTT.
+--dry-run              Mo viewer offline realtime, khong ket noi MQTT.
+--offline-history N    So frame giu trong waterfall viewer. Mac dinh = 200.
 --max-frames N         Chi xu ly N frame.
 --no-repeat            Doc het file thi dung.
 --bin PATH             Duong dan file raw .bin.
---radar-cfg PATH       Duong dan file .cfg dung voi raw .bin.
 --fft-size N           FFT size. Mac dinh = numAdcSamples.
 --range-bins N         So range bin publish. Mac dinh = fft_size / 2.
 --no-clutter-removal   Tat IIR static clutter removal.
 --clutter-alpha X      Alpha cho IIR clutter removal. Mac dinh = 0.95.
---config-once          Chi gui metadata config o frame dau tien.
 ```
 
 ## 7. Kiem tra loi thuong gap
@@ -180,11 +180,10 @@ Set --access-token or TB_ACCESS_TOKEN before publishing.
 
 Hay dien token cua ThingsBoard device bang `--access-token` hoac `$env:TB_ACCESS_TOKEN`.
 
-Neu so frame/shape sai, kha nang cao la raw `.bin` khong khop `.cfg`. Hay chon lai:
+Neu so frame/shape sai, kha nang cao la raw `.bin` khong khop thong so hard-code trong script:
 
 ```text
---bin dung file raw
---radar-cfg dung file cfg luc capture file raw do
+so TX/RX/samples/loops trong script phai dung voi file raw
 ```
 
 Neu MQTT khong ket noi duoc, kiem tra:
@@ -202,7 +201,7 @@ Telemetry key quan trong:
 
 ```text
 frame_id
-bins
+bin
 range_profile
 ```
 
