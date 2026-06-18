@@ -142,3 +142,8 @@ Nếu worker không nhận được dữ liệu UDP, hãy kiểm tra lại IP/po
 ## Ghi chú an toàn
 
 Mặc định server chạy `127.0.0.1` (local-only). Nếu đổi sang `0.0.0.0` để truy cập từ máy khác, hãy cân nhắc bảo mật mạng nội bộ.
+
+
+.venv\Scripts\activate 
+ pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

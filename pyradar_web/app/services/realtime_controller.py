@@ -35,6 +35,7 @@ class RealTimeController:
         com_port: str,
         cfg_path: str,
         cli_baud: int = 921600,
+        numframes: int = 30,
     ) -> Dict[str, object]:
         com_port = (com_port or "").strip()
         cfg_path = (cfg_path or "").strip()
@@ -44,6 +45,8 @@ class RealTimeController:
             raise ValueError("cfg_path is required")
         if cli_baud <= 0:
             raise ValueError("cli_baud must be > 0")
+        if numframes <= 0:
+            raise ValueError("numframes must be > 0")
 
         worker = Path(DEFAULT_REALTIME_WORKER)
         if not worker.exists():
@@ -59,6 +62,7 @@ class RealTimeController:
                 "com_port": com_port,
                 "cfg_path": cfg_path,
                 "cli_baud": cli_baud,
+                "numframes": numframes,
             }
 
             # create localhost TCP server for worker -> API
@@ -82,6 +86,8 @@ class RealTimeController:
                     str(cli_baud),
                     "--cfg-path",
                     cfg_path,
+                    "--numframes",
+                    str(numframes),
                 ],
                 cwd=str(worker.parent),
                 stdout=subprocess.PIPE,

@@ -1,4 +1,6 @@
 let resultsSocket = null;
+let lastRangePlot = null;
+let lastRangeSeq = null;
 
 async function fetchJson(url, options) {
 	const res = await fetch(url, options);
@@ -26,9 +28,226 @@ function setStatus(text) {
 function appendResultLine(obj) {
 	const out = document.getElementById("resultOut");
 	if (!out) return;
-	const line = JSON.stringify(obj, null, 2);
+
+	const copy = JSON.parse(JSON.stringify(obj || {}));
+	const data = copy.data || copy;
+	if (data.range_plot) {
+		const range = data.range_plot;
+		data.range_plot = {
+			ready: range.ready,
+			frame_count: range.frame_count,
+			range_bins: range.range_bins,
+			fft_size: range.fft_size,
+			min_db: range.min_db,
+			max_db: range.max_db,
+			range_resolution_m: range.range_resolution_m,
+			error: range.error
+		};
+	}
+
+	const line = JSON.stringify(copy, null, 2);
 	out.textContent = (out.textContent ? out.textContent + "\n\n" : "") + line;
+	const maxChars = 30000;
+	if (out.textContent.length > maxChars) {
+		out.textContent = out.textContent.slice(out.textContent.length - maxChars);
+	}
 	out.scrollTop = out.scrollHeight;
+}
+
+function resizeCanvas(canvas) {
+	const ratio = window.devicePixelRatio || 1;
+	const rect = canvas.getBoundingClientRect();
+	const width = Math.max(1, Math.floor(rect.width * ratio));
+	const height = Math.max(1, Math.floor(rect.height * ratio));
+	if (canvas.width !== width || canvas.height !== height) {
+		canvas.width = width;
+		canvas.height = height;
+	}
+	return { width, height, ratio };
+}
+
+function colorRamp(t) {
+	const x = Math.max(0, Math.min(1, t));
+	const stops = [
+		[15, 23, 42],
+		[30, 64, 175],
+		[8, 145, 178],
+		[34, 197, 94],
+		[250, 204, 21]
+	];
+	const scaled = x * (stops.length - 1);
+	const i = Math.min(stops.length - 2, Math.floor(scaled));
+	const local = scaled - i;
+	const a = stops[i];
+	const b = stops[i + 1];
+	return [
+		Math.round(a[0] + (b[0] - a[0]) * local),
+		Math.round(a[1] + (b[1] - a[1]) * local),
+		Math.round(a[2] + (b[2] - a[2]) * local)
+	];
+}
+
+function drawEmptyCanvas(canvas, label) {
+	if (!canvas) return;
+	const { width, height, ratio } = resizeCanvas(canvas);
+	const ctx = canvas.getContext("2d");
+	ctx.clearRect(0, 0, width, height);
+	ctx.fillStyle = "#101827";
+	ctx.fillRect(0, 0, width, height);
+	ctx.fillStyle = "#9ca3af";
+	ctx.font = `${12 * ratio}px system-ui, sans-serif`;
+	ctx.textAlign = "center";
+	ctx.fillText(label, width / 2, height / 2);
+}
+
+function drawRangeProfile(profile, minDb, maxDb) {
+	const canvas = document.getElementById("rangeProfileCanvas");
+	if (!canvas || !Array.isArray(profile) || !profile.length) {
+		drawEmptyCanvas(canvas, "No profile data");
+		return;
+	}
+
+	const { width, height, ratio } = resizeCanvas(canvas);
+	const ctx = canvas.getContext("2d");
+	const padLeft = 44 * ratio;
+	const padRight = 16 * ratio;
+	const padTop = 16 * ratio;
+	const padBottom = 28 * ratio;
+	const plotW = Math.max(1, width - padLeft - padRight);
+	const plotH = Math.max(1, height - padTop - padBottom);
+	let min = Number.isFinite(minDb) ? minDb : Math.min(...profile);
+	let max = Number.isFinite(maxDb) ? maxDb : Math.max(...profile);
+	if (min === max) {
+		min -= 1;
+		max += 1;
+	}
+
+	ctx.clearRect(0, 0, width, height);
+	ctx.fillStyle = "#101827";
+	ctx.fillRect(0, 0, width, height);
+	ctx.strokeStyle = "#233047";
+	ctx.lineWidth = 1 * ratio;
+	for (let i = 0; i <= 4; i += 1) {
+		const y = padTop + (plotH * i) / 4;
+		ctx.beginPath();
+		ctx.moveTo(padLeft, y);
+		ctx.lineTo(width - padRight, y);
+		ctx.stroke();
+	}
+
+	ctx.strokeStyle = "#38bdf8";
+	ctx.lineWidth = 2 * ratio;
+	ctx.beginPath();
+	profile.forEach((value, index) => {
+		const x = padLeft + (plotW * index) / Math.max(1, profile.length - 1);
+		const y = padTop + plotH - ((value - min) / (max - min)) * plotH;
+		if (index === 0) ctx.moveTo(x, y);
+		else ctx.lineTo(x, y);
+	});
+	ctx.stroke();
+
+	ctx.fillStyle = "#cbd5e1";
+	ctx.font = `${11 * ratio}px system-ui, sans-serif`;
+	ctx.textAlign = "left";
+	ctx.fillText(`${max.toFixed(1)} dB`, 8 * ratio, padTop + 8 * ratio);
+	ctx.fillText(`${min.toFixed(1)} dB`, 8 * ratio, padTop + plotH);
+	ctx.textAlign = "center";
+	ctx.fillText("Range bin", padLeft + plotW / 2, height - 8 * ratio);
+}
+
+function drawRangeTime(matrix, minDb, maxDb) {
+	const canvas = document.getElementById("rangeTimeCanvas");
+	if (!canvas || !Array.isArray(matrix) || !matrix.length || !Array.isArray(matrix[0])) {
+		drawEmptyCanvas(canvas, "No range-time data");
+		return;
+	}
+
+	const { width, height, ratio } = resizeCanvas(canvas);
+	const ctx = canvas.getContext("2d");
+	const padLeft = 44 * ratio;
+	const padRight = 16 * ratio;
+	const padTop = 12 * ratio;
+	const padBottom = 28 * ratio;
+	const plotW = Math.max(1, width - padLeft - padRight);
+	const plotH = Math.max(1, height - padTop - padBottom);
+	const rows = matrix.length;
+	const cols = matrix[0].length;
+	let min = Number.isFinite(minDb) ? minDb : Infinity;
+	let max = Number.isFinite(maxDb) ? maxDb : -Infinity;
+	if (!Number.isFinite(min) || !Number.isFinite(max)) {
+		matrix.forEach((row) => {
+			row.forEach((value) => {
+				if (Number.isFinite(value)) {
+					min = Math.min(min, value);
+					max = Math.max(max, value);
+				}
+			});
+		});
+	}
+	if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
+		min = 0;
+		max = 1;
+	}
+
+	ctx.clearRect(0, 0, width, height);
+	ctx.fillStyle = "#101827";
+	ctx.fillRect(0, 0, width, height);
+
+	const cellW = plotW / Math.max(1, rows);
+	const cellH = plotH / Math.max(1, cols);
+	for (let frame = 0; frame < rows; frame += 1) {
+		const row = matrix[frame];
+		for (let bin = 0; bin < cols; bin += 1) {
+			const value = row[bin];
+			const rgb = colorRamp((value - min) / (max - min));
+			ctx.fillStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+			const x = padLeft + frame * cellW;
+			const y = padTop + plotH - (bin + 1) * cellH;
+			ctx.fillRect(x, y, Math.ceil(cellW), Math.ceil(cellH));
+		}
+	}
+
+	ctx.strokeStyle = "#d5dae4";
+	ctx.lineWidth = 1 * ratio;
+	ctx.strokeRect(padLeft, padTop, plotW, plotH);
+	ctx.fillStyle = "#cbd5e1";
+	ctx.font = `${11 * ratio}px system-ui, sans-serif`;
+	ctx.textAlign = "center";
+	ctx.fillText("Frame in batch", padLeft + plotW / 2, height - 8 * ratio);
+	ctx.save();
+	ctx.translate(14 * ratio, padTop + plotH / 2);
+	ctx.rotate(-Math.PI / 2);
+	ctx.fillText("Range bin", 0, 0);
+	ctx.restore();
+}
+
+function renderRangePlot(rangePlot, seq) {
+	const meta = document.getElementById("rangeMeta");
+	if (!rangePlot) return;
+	if (!rangePlot.ready) {
+		if (meta) meta.textContent = rangePlot.error || "Range plot is not ready.";
+		return;
+	}
+
+	lastRangePlot = rangePlot;
+	lastRangeSeq = seq;
+	drawRangeProfile(rangePlot.range_profile || [], rangePlot.min_db, rangePlot.max_db);
+	drawRangeTime(rangePlot.range_time || [], rangePlot.min_db, rangePlot.max_db);
+
+	if (meta) {
+		const resolution = rangePlot.range_resolution_m
+			? `, ${rangePlot.range_resolution_m} m/bin`
+			: "";
+		meta.textContent = `Seq ${seq}: ${rangePlot.frame_count} frames x ${rangePlot.range_bins} bins${resolution}`;
+	}
+}
+
+function handleResultItem(item) {
+	const data = item && item.data ? item.data : item;
+	if (data && data.range_plot) {
+		renderRangePlot(data.range_plot, data.seq);
+	}
+	appendResultLine(item);
 }
 
 async function loadComPorts() {
@@ -136,7 +355,7 @@ function connectResultsSocket() {
 		try {
 			const payload = JSON.parse(evt.data);
 			const results = payload.results || [];
-			results.forEach((r) => appendResultLine(r));
+			results.forEach((r) => handleResultItem(r));
 		} catch {
 			// ignore
 		}
@@ -153,7 +372,7 @@ async function startRealtime() {
 		const data = await fetchJson("/realtime/start", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ com_port: com, cfg_path: cfg, cli_baud: 921600 })
+			body: JSON.stringify({ com_port: com, cfg_path: cfg, cli_baud: 921600, numframes: 30 })
 		});
 		setStatus(data.running ? "đang chạy" : "đã bắt đầu");
 		msg.textContent = "Đã bắt đầu hardware.";
@@ -210,6 +429,16 @@ function wireUi() {
 (async () => {
 	setStatus("Idle");
 	wireUi();
+	drawEmptyCanvas(document.getElementById("rangeProfileCanvas"), "Waiting for range profile");
+	drawEmptyCanvas(document.getElementById("rangeTimeCanvas"), "Waiting for range-time");
+	window.addEventListener("resize", () => {
+		if (lastRangePlot) {
+			renderRangePlot(lastRangePlot, lastRangeSeq);
+		} else {
+			drawEmptyCanvas(document.getElementById("rangeProfileCanvas"), "Waiting for range profile");
+			drawEmptyCanvas(document.getElementById("rangeTimeCanvas"), "Waiting for range-time");
+		}
+	});
 	await loadComPorts();
 	await loadCfgFiles();
 })();

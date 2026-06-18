@@ -96,6 +96,284 @@ def _resolve_repo_path(path_raw: str, default_dir: str = "") -> str:
     return str(candidates[0])
 
 
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _parse_cli_radar_config(path_raw: str) -> Dict[str, Any]:
+    """Read the xWR CLI fields needed for range-time DSP metadata."""
+    path = Path(_resolve_repo_path(path_raw, default_dir="configFiles"))
+    metadata: Dict[str, Any] = {}
+    if not path.exists():
+        return metadata
+
+    rx_mask: Optional[int] = None
+    tx_mask: Optional[int] = None
+    samples: Optional[int] = None
+    sample_rate_ksps: Optional[int] = None
+    freq_slope_mhz_us: Optional[float] = None
+    chirp_start: Optional[int] = None
+    chirp_end: Optional[int] = None
+    frame_loops: Optional[int] = None
+    frame_period_ms: Optional[float] = None
+
+    with path.open("r", encoding="utf-8", errors="ignore") as cfg_file:
+        for raw_line in cfg_file:
+            line = raw_line.strip()
+            if not line or line.startswith(("%", "#")):
+                continue
+
+            parts = line.split()
+            cmd = parts[0]
+            try:
+                if cmd == "channelCfg" and len(parts) >= 3:
+                    rx_mask = int(float(parts[1]))
+                    tx_mask = int(float(parts[2]))
+                elif cmd == "profileCfg" and len(parts) >= 12:
+                    freq_slope_mhz_us = float(parts[8])
+                    samples = int(float(parts[10]))
+                    sample_rate_ksps = int(float(parts[11]))
+                elif cmd == "frameCfg" and len(parts) >= 6:
+                    chirp_start = int(float(parts[1]))
+                    chirp_end = int(float(parts[2]))
+                    frame_loops = int(float(parts[3]))
+                    frame_period_ms = float(parts[5])
+            except ValueError:
+                continue
+
+    if rx_mask is not None:
+        metadata["rx"] = int(rx_mask).bit_count()
+    if tx_mask is not None:
+        metadata["tx"] = int(tx_mask).bit_count()
+    if samples is not None:
+        metadata["samples"] = samples
+    if frame_loops is not None:
+        metadata["chirps"] = frame_loops
+    if sample_rate_ksps is not None:
+        metadata["sample_rate_ksps"] = sample_rate_ksps
+    if freq_slope_mhz_us is not None:
+        metadata["freq_slope_mhz_us"] = freq_slope_mhz_us
+    if frame_period_ms is not None:
+        metadata["frame_period_ms"] = frame_period_ms
+    if chirp_start is not None and chirp_end is not None:
+        metadata["chirps_per_loop"] = int(chirp_end - chirp_start + 1)
+
+    return metadata
+
+
+def _normalize_adc_params(adc_params: Any, cfg_path: str) -> Dict[str, Any]:
+    params = _parse_cli_radar_config(cfg_path)
+    if isinstance(adc_params, dict):
+        for key, value in adc_params.items():
+            params[str(key)] = _to_builtin(value)
+
+    params["chirps"] = _positive_int(params.get("chirps"), 128)
+    params["tx"] = _positive_int(params.get("tx"), 1)
+    params["rx"] = _positive_int(params.get("rx"), 4)
+    params["samples"] = _positive_int(params.get("samples"), 128)
+    params["IQ"] = _positive_int(params.get("IQ"), 2)
+    params["bytes"] = _positive_int(params.get("bytes"), 2)
+    return params
+
+
+def _range_resolution_m(params: Dict[str, Any]) -> Optional[float]:
+    sample_rate_ksps = params.get("sample_rate_ksps")
+    freq_slope_mhz_us = params.get("freq_slope_mhz_us")
+    samples = params.get("samples")
+    if sample_rate_ksps is None or freq_slope_mhz_us is None or samples is None:
+        return None
+
+    adc_sample_period_us = 1000.0 / float(sample_rate_ksps) * float(samples)
+    bandwidth_hz = float(freq_slope_mhz_us) * adc_sample_period_us * 1e6
+    if bandwidth_hz <= 0:
+        return None
+    return 3e8 / (2.0 * bandwidth_hz)
+
+
+def _frame_int16_count(params: Dict[str, Any]) -> int:
+    return (
+        int(params["chirps"])
+        * int(params["tx"])
+        * int(params["rx"])
+        * int(params["samples"])
+        * int(params["IQ"])
+    )
+
+
+def _raw_to_complex(raw_data: Any, swap: int = 1) -> Any:
+    if raw_data.size % 4 != 0:
+        raise ValueError("raw int16 length must be divisible by 4 for IQ unpacking")
+
+    data = raw_data.reshape(-1, 4)
+    if swap == 0:
+        raw_i = data[:, [0, 1]].flatten()
+        raw_q = data[:, [2, 3]].flatten()
+    else:
+        raw_i = data[:, [2, 3]].flatten()
+        raw_q = data[:, [0, 1]].flatten()
+
+    return (raw_i + 1j * raw_q).astype(np.complex64)
+
+
+def _process_to_cube(
+    complex_data: Any,
+    num_tx: int,
+    num_rx: int,
+    num_samples_per_chirp: int,
+    num_loops_per_frame: int,
+) -> Any:
+    num_chirps = num_tx * num_loops_per_frame
+    samples_per_frame = num_chirps * num_rx * num_samples_per_chirp
+    valid_len = (len(complex_data) // samples_per_frame) * samples_per_frame
+    complex_data = complex_data[:valid_len]
+
+    cube = complex_data.reshape(-1, num_chirps, num_rx, num_samples_per_chirp)
+    cube = cube.reshape(-1, num_loops_per_frame, num_tx, num_rx, num_samples_per_chirp)
+    cube = cube.transpose(0, 2, 3, 1, 4)
+    return cube.reshape(
+        cube.shape[0], num_tx * num_rx, num_loops_per_frame, num_samples_per_chirp
+    )
+
+
+def _raw_frame_to_radar_cube(raw_frame: Any, params: Dict[str, Any]) -> Any:
+    expected = _frame_int16_count(params)
+    if raw_frame.size != expected:
+        raise ValueError(f"expected {expected} int16 values per frame, got {raw_frame.size}")
+
+    complex_data = _raw_to_complex(raw_frame, swap=1)
+    cube = _process_to_cube(
+        complex_data,
+        int(params["tx"]),
+        int(params["rx"]),
+        int(params["samples"]),
+        int(params["chirps"]),
+    )
+    if cube.shape[0] != 1:
+        raise ValueError(f"expected one decoded frame, got cube shape {cube.shape}")
+    return cube[0]
+
+
+def _static_clutter_removal_iir(radar_cube: Any, alpha: float = 0.95) -> Any:
+    if not 0.0 <= alpha < 1.0:
+        raise ValueError("clutter alpha must be in the range [0, 1)")
+
+    corrected = np.zeros_like(radar_cube)
+    clutter = radar_cube[:, :, 0:1]
+    for chirp_idx in range(radar_cube.shape[2]):
+        current = radar_cube[:, :, chirp_idx : chirp_idx + 1]
+        clutter = alpha * clutter + (1.0 - alpha) * current
+        corrected[:, :, chirp_idx : chirp_idx + 1] = current - clutter
+    return corrected
+
+
+def _compute_range_profile(
+    radar_cube_frame: Any,
+    fft_size: int,
+    range_bins: int,
+    clutter_removal: bool,
+    clutter_alpha: float,
+) -> Any:
+    if fft_size < radar_cube_frame.shape[-1]:
+        raise ValueError(
+            f"fft_size={fft_size} must be >= numAdcSamples={radar_cube_frame.shape[-1]}"
+        )
+
+    radar_cube = radar_cube_frame[np.newaxis, ...]
+    if clutter_removal:
+        radar_cube = _static_clutter_removal_iir(radar_cube, alpha=clutter_alpha)
+
+    window = np.hanning(radar_cube.shape[3]).astype(np.float32)
+    range_fft = np.fft.fft(radar_cube * window, n=fft_size, axis=3)
+    range_fft = range_fft[..., :range_bins]
+    magnitude_all = np.abs(range_fft)
+    rtm = np.mean(magnitude_all, axis=(1, 2))
+    profile = 20.0 * np.log10(rtm[0] + 1e-6)
+    return profile.astype(np.float32)
+
+
+def _round_series(values: Any, digits: int = 3) -> List[float]:
+    return [round(float(value), digits) for value in values.tolist()]
+
+
+def _build_range_plot(
+    raw_data: Any,
+    adc_params: Any,
+    args_dict: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    params = _normalize_adc_params(adc_params, str(args_dict.get("cfg_path", "")))
+    requested_frames = _positive_int(args_dict.get("numframes"), 30)
+    frame_len = _frame_int16_count(params)
+    if frame_len <= 0:
+        return None
+
+    total_elements = int(getattr(raw_data, "size", 0) or 0)
+    complete_frames = min(requested_frames, total_elements // frame_len)
+    if complete_frames < requested_frames:
+        return {
+            "ready": False,
+            "requested_frames": requested_frames,
+            "complete_frames": complete_frames,
+            "frame_int16_count": frame_len,
+            "raw_int16_count": total_elements,
+            "error": "not enough complete frames for range-time plot",
+        }
+
+    fft_size = _positive_int(args_dict.get("range_fft_size"), int(params["samples"]))
+    range_bins = _positive_int(args_dict.get("range_bins"), fft_size // 2)
+    range_bins = min(range_bins, fft_size)
+    clutter_removal = bool(args_dict.get("range_clutter_removal", True))
+    clutter_alpha = _positive_float(args_dict.get("range_clutter_alpha"), 0.95)
+
+    frames = raw_data[: complete_frames * frame_len].reshape(complete_frames, frame_len)
+    profiles = []
+    for raw_frame in frames:
+        radar_cube = _raw_frame_to_radar_cube(raw_frame, params)
+        profiles.append(
+            _compute_range_profile(
+                radar_cube,
+                fft_size=fft_size,
+                range_bins=range_bins,
+                clutter_removal=clutter_removal,
+                clutter_alpha=clutter_alpha,
+            )
+        )
+
+    range_time = np.vstack(profiles).astype(np.float32)
+    current_profile = range_time[-1]
+    finite = range_time[np.isfinite(range_time)]
+    min_db = float(np.min(finite)) if finite.size else 0.0
+    max_db = float(np.max(finite)) if finite.size else 1.0
+    resolution = _range_resolution_m(params)
+
+    return {
+        "ready": True,
+        "frame_count": int(complete_frames),
+        "range_bins": int(range_bins),
+        "fft_size": int(fft_size),
+        "bin": list(range(int(range_bins))),
+        "range_profile": _round_series(current_profile),
+        "range_time": [_round_series(row) for row in range_time],
+        "min_db": round(min_db, 3),
+        "max_db": round(max_db, 3),
+        "range_resolution_m": round(float(resolution), 6) if resolution else None,
+        "clutter_removal": clutter_removal,
+        "clutter_alpha": clutter_alpha,
+        "adc_params": _to_builtin(params),
+    }
+
+
 class DropOldestQueue:
     """Bounded multiprocessing queue that drops stale items instead of blocking."""
 
@@ -197,7 +475,7 @@ def capture_worker_process(
 
             size = int(getattr(raw_adc_data, "size", 0) or 0)
             if raw_adc_data is not None and size > 0:
-                preprocess_queue.put((seq, time.time(), raw_adc_data))
+                preprocess_queue.put((seq, time.time(), raw_adc_data, _to_builtin(dict(adc_params))))
                 seq += 1
             else:
                 time.sleep(0.001)
@@ -247,7 +525,12 @@ def preprocessing_worker_process(
 
     while not exit_event.is_set():
         try:
-            seq, ts, raw_data = preprocess_queue.get(block=True, timeout=1.0)
+            item = preprocess_queue.get(block=True, timeout=1.0)
+            if isinstance(item, tuple) and len(item) == 4:
+                seq, ts, raw_data, adc_params = item
+            else:
+                seq, ts, raw_data = item
+                adc_params = {}
         except Empty:
             continue
         except Exception as exc:
@@ -285,6 +568,14 @@ def preprocessing_worker_process(
                 "sample_max": sample_max,
                 "preview": preview_slice,
             }
+
+            try:
+                features["range_plot"] = _build_range_plot(raw_data, adc_params, args_dict)
+            except Exception as exc:
+                features["range_plot"] = {
+                    "ready": False,
+                    "error": str(exc),
+                }
 
             ai_queue.put((seq, ts, features))
         except Exception as exc:
@@ -336,7 +627,7 @@ def ai_worker_process(
             }
 
             payload = {
-                "type": "inference",
+                "type": "range_dsp" if features.get("range_plot") else "inference",
                 "mode": "hardware",
                 "seq": int(seq),
                 "ts": float(ts),
@@ -354,6 +645,7 @@ def ai_worker_process(
                     "sample_max": features["sample_max"],
                 },
                 "result": ai_inference_result,
+                "range_plot": features.get("range_plot"),
                 "preview": features["preview"],
                 "note": "Decoupled multi-process architecture active.",
             }
@@ -403,11 +695,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cli-baud", type=int, default=921600)
     parser.add_argument("--cfg-path", type=str, required=True)
     parser.add_argument("--dca-cfg", type=str, default="cf.json")
-    parser.add_argument("--numframes", type=int, default=2)
+    parser.add_argument("--numframes", type=int, default=30)
     parser.add_argument("--frame-num-in-buf", type=int, default=128)
     parser.add_argument("--interval", type=float, default=0.5)
     parser.add_argument("--preprocess-queue-size", type=int, default=10)
     parser.add_argument("--ai-queue-size", type=int, default=10)
+    parser.add_argument("--range-fft-size", type=int, default=0)
+    parser.add_argument("--range-bins", type=int, default=0)
+    parser.add_argument("--range-clutter-alpha", type=float, default=0.95)
+    parser.add_argument(
+        "--no-range-clutter-removal",
+        dest="range_clutter_removal",
+        action="store_false",
+        default=True,
+    )
 
     args = parser.parse_args(argv)
     args_dict = vars(args)

@@ -47,6 +47,7 @@ class StartRequest(BaseModel):
     com_port: str = Field(..., description="Example: COM5")
     cfg_path: str = Field(..., description="Absolute path or filename under configFiles/")
     cli_baud: int = Field(921600, ge=1200, le=4000000)
+    numframes: int = Field(30, ge=1, le=512)
 
 
 @router.post("/start")
@@ -56,6 +57,7 @@ def start(payload: StartRequest):
             com_port=payload.com_port,
             cfg_path=payload.cfg_path,
             cli_baud=payload.cli_baud,
+            numframes=payload.numframes,
         )
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
