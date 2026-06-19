@@ -7,7 +7,7 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Deque, Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional
 
 from app.core.settings import DEFAULT_REALTIME_WORKER
 
@@ -18,10 +18,15 @@ class RealTimeController:
         self._lock = threading.Lock()
         self._log_buffer: Deque[Dict[str, object]] = deque(maxlen=log_max_lines)
         self._results_buffer: Deque[Dict[str, object]] = deque(maxlen=results_max_items)
+        self._latest_range_plot: Optional[Dict[str, object]] = None
+        self._result_listeners: Dict[int, Callable[[Dict[str, object]], None]] = {}
+        self._listener_lock = threading.Lock()
+        self._next_listener_id = 1
         self._reader_thread: Optional[threading.Thread] = None
         self._socket_thread: Optional[threading.Thread] = None
+        self._result_conn_threads: List[threading.Thread] = []
         self._server_sock: Optional[socket.socket] = None
-        self._conn_sock: Optional[socket.socket] = None
+        self._conn_socks: List[socket.socket] = []
         self._conn_lock = threading.Lock()
         self._start_time: Optional[float] = None
         self._last_exit_code: Optional[int] = None
@@ -58,6 +63,7 @@ class RealTimeController:
 
             self._results_buffer.clear()
             self._log_buffer.clear()
+            self._latest_range_plot = None
             self._last_params = {
                 "com_port": com_port,
                 "cfg_path": cfg_path,
@@ -68,7 +74,7 @@ class RealTimeController:
             # create localhost TCP server for worker -> API
             self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._server_sock.bind(("127.0.0.1", 0))
-            self._server_sock.listen(1)
+            self._server_sock.listen(4)
             host, port = self._server_sock.getsockname()
             self._append_log(f"result socket listening on {host}:{port}")
 
@@ -167,6 +173,27 @@ class RealTimeController:
             return []
         return list(self._results_buffer)[-tail:]
 
+    def get_latest_result(self) -> Optional[Dict[str, object]]:
+        if not self._results_buffer:
+            return None
+        return self._results_buffer[-1]
+
+    def get_latest_range_plot(self) -> Optional[Dict[str, object]]:
+        if self._latest_range_plot is None:
+            return None
+        return dict(self._latest_range_plot)
+
+    def add_result_listener(self, listener: Callable[[Dict[str, object]], None]) -> int:
+        with self._listener_lock:
+            listener_id = self._next_listener_id
+            self._next_listener_id += 1
+            self._result_listeners[listener_id] = listener
+            return listener_id
+
+    def remove_result_listener(self, listener_id: int) -> None:
+        with self._listener_lock:
+            self._result_listeners.pop(listener_id, None)
+
     def _read_output(self, process: subprocess.Popen) -> None:
         if process.stdout is None:
             return
@@ -192,12 +219,36 @@ class RealTimeController:
             return
 
         try:
-            conn, _addr = server.accept()
-            with self._conn_lock:
-                self._conn_sock = conn
-            self._append_log("worker connected to result socket")
+            server.settimeout(0.5)
+            while True:
+                with self._lock:
+                    process = self._process
+                if process is None or process.poll() is not None:
+                    break
 
-            buffer = b""
+                try:
+                    conn, _addr = server.accept()
+                except socket.timeout:
+                    continue
+
+                with self._conn_lock:
+                    self._conn_socks.append(conn)
+                self._append_log("worker connected to result socket")
+
+                thread = threading.Thread(
+                    target=self._read_result_conn,
+                    args=(conn,),
+                    daemon=True,
+                )
+                with self._lock:
+                    self._result_conn_threads.append(thread)
+                thread.start()
+        except Exception as exc:
+            self._append_log(f"result socket error: {exc}")
+
+    def _read_result_conn(self, conn: socket.socket) -> None:
+        buffer = b""
+        try:
             while True:
                 chunk = conn.recv(4096)
                 if not chunk:
@@ -212,36 +263,42 @@ class RealTimeController:
                         obj = json.loads(payload.decode("utf-8", errors="replace"))
                     except Exception:
                         obj = {"type": "raw", "data": payload.decode("utf-8", errors="replace")}
-
                     self._append_result(obj)
         except Exception as exc:
-            self._append_log(f"result socket error: {exc}")
+            self._append_log(f"result connection error: {exc}")
         finally:
             with self._conn_lock:
                 try:
-                    if self._conn_sock is not None:
-                        self._conn_sock.close()
-                except Exception:
+                    self._conn_socks.remove(conn)
+                except ValueError:
                     pass
-                self._conn_sock = None
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _send_control(self, obj: Dict[str, object]) -> None:
         data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
         with self._conn_lock:
-            conn = self._conn_sock
-            if conn is None:
-                return
+            conns = list(self._conn_socks)
+        if not conns:
+            return
+        for conn in conns:
             try:
                 conn.sendall(data)
             except Exception:
-                return
+                continue
 
     def _cleanup_sockets_locked(self) -> None:
         try:
             with self._conn_lock:
-                if self._conn_sock is not None:
-                    self._conn_sock.close()
-                    self._conn_sock = None
+                conns = list(self._conn_socks)
+                self._conn_socks.clear()
+            for conn in conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -262,6 +319,31 @@ class RealTimeController:
             "data": obj,
         }
         self._results_buffer.append(item)
+
+        if not isinstance(obj, dict):
+            return
+
+        range_plot = obj.get("range_plot")
+        if not isinstance(range_plot, dict) or not range_plot.get("ready"):
+            listeners: List[Callable[[Dict[str, object]], None]]
+            with self._listener_lock:
+                listeners = list(self._result_listeners.values())
+            for listener in listeners:
+                try:
+                    listener(item)
+                except Exception:
+                    pass
+            return
+
+        self._latest_range_plot = dict(range_plot)
+
+        with self._listener_lock:
+            listeners = list(self._result_listeners.values())
+        for listener in listeners:
+            try:
+                listener(item)
+            except Exception:
+                pass
 
 
 realtime_controller = RealTimeController()

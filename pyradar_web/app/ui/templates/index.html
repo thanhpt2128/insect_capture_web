@@ -1,11 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-	<meta charset="utf-8" />
-	<meta name="viewport" content="width=device-width, initial-scale=1" />
-	<title>RealTime Insect Detection Admin</title>
-	<link rel="stylesheet" href="/static/styles.css" />
-</head>
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>RealTime Insect Detection Admin</title>
+		<link rel="stylesheet" href="/static/styles.css" />
+		<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+	</head>
 <body>
 	<div class="shell">
 		<header class="hero">
@@ -54,11 +55,11 @@
 				<div class="plot-stack">
 					<div class="plot-panel">
 						<div class="plot-title">Range Profile</div>
-						<canvas id="rangeProfileCanvas" width="720" height="240"></canvas>
+						<div id="rangeProfilePlot" class="plot-surface profile-plot"></div>
 					</div>
 					<div class="plot-panel">
 						<div class="plot-title">Range-Time</div>
-						<canvas id="rangeTimeCanvas" width="720" height="320"></canvas>
+						<canvas id="rangeTimePlot" class="plot-surface heatmap-plot" width="720" height="320"></canvas>
 					</div>
 				</div>
 			</section>

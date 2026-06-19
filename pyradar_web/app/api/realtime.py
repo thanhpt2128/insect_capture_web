@@ -1,6 +1,10 @@
 import asyncio
+from io import BytesIO
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+import numpy as np
+from fastapi import APIRouter, HTTPException, Response, WebSocket, WebSocketDisconnect
+from matplotlib.figure import Figure
+
 from pydantic import BaseModel, Field
 
 from app.services.realtime_controller import realtime_controller
@@ -8,39 +12,125 @@ from app.services.realtime_controller import realtime_controller
 router = APIRouter()
 
 
-def _find_marker(lines, marker):
-    if not marker:
-        return -1
-    marker_ts, marker_id = marker
-    for index, item in enumerate(lines):
-        if item.get("ts") == marker_ts and item.get("id") == marker_id:
-            return index
-    return -1
+def _render_png(fig: Figure) -> bytes:
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", dpi=120, bbox_inches="tight")
+    return buffer.getvalue()
 
 
-async def _stream_results(websocket: WebSocket, tail: int = 50, interval: float = 0.5):
+def _build_placeholder_png(label: str) -> bytes:
+    fig = Figure(figsize=(7.2, 2.6), dpi=120, facecolor="#101827")
+    ax = fig.subplots()
+    ax.set_facecolor("#101827")
+    ax.text(0.5, 0.5, label, color="#9ca3af", ha="center", va="center", fontsize=12)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    return _render_png(fig)
+
+
+def _extract_latest_range_plot():
+    range_plot = realtime_controller.get_latest_range_plot()
+    if not isinstance(range_plot, dict) or not range_plot.get("ready"):
+        return None
+    return range_plot
+
+
+def _profile_png(range_plot: dict) -> bytes:
+    profile = np.asarray(range_plot.get("range_profile") or [], dtype=float)
+    if profile.size == 0:
+        return _build_placeholder_png("No profile data")
+
+    min_db = float(range_plot.get("min_db", np.min(profile)))
+    max_db = float(range_plot.get("max_db", np.max(profile)))
+    if min_db == max_db:
+        min_db -= 1.0
+        max_db += 1.0
+
+    fig = Figure(figsize=(7.2, 2.6), dpi=120, facecolor="#101827")
+    ax = fig.subplots()
+    ax.set_facecolor("#101827")
+    ax.plot(np.arange(profile.size), profile, color="#38bdf8", linewidth=1.8)
+    ax.set_xlim(0, max(profile.size - 1, 1))
+    ax.set_ylim(min_db, max_db)
+    ax.set_xlabel("Range bin", color="#cbd5e1")
+    ax.set_ylabel("Amplitude (dB)", color="#cbd5e1")
+    ax.tick_params(colors="#cbd5e1")
+    ax.grid(True, color="#233047", linewidth=0.8)
+    for spine in ax.spines.values():
+        spine.set_color("#d5dae4")
+    fig.tight_layout()
+    return _render_png(fig)
+
+
+def _range_time_png(range_plot: dict) -> bytes:
+    matrix = np.asarray(range_plot.get("range_time") or [], dtype=float)
+    if matrix.ndim != 2 or matrix.size == 0:
+        return _build_placeholder_png("No range-time data")
+
+    min_db = float(range_plot.get("min_db", np.nanmin(matrix)))
+    max_db = float(range_plot.get("max_db", np.nanmax(matrix)))
+    if min_db == max_db:
+        min_db -= 1.0
+        max_db += 1.0
+
+    fig = Figure(figsize=(7.2, 3.2), dpi=120, facecolor="#101827")
+    ax = fig.subplots()
+    ax.set_facecolor("#101827")
+    image = ax.imshow(
+        matrix.T,
+        aspect="auto",
+        origin="lower",
+        cmap="viridis",
+        vmin=min_db,
+        vmax=max_db,
+        interpolation="nearest",
+    )
+    ax.set_xlabel("Sliding frame history", color="#cbd5e1")
+    ax.set_ylabel("Range bin", color="#cbd5e1")
+    ax.tick_params(colors="#cbd5e1")
+    for spine in ax.spines.values():
+        spine.set_color("#d5dae4")
+    colorbar = fig.colorbar(image, ax=ax)
+    colorbar.set_label("dB", color="#cbd5e1")
+    colorbar.ax.yaxis.set_tick_params(color="#cbd5e1")
+    for label in colorbar.ax.get_yticklabels():
+        label.set_color("#cbd5e1")
+    fig.tight_layout()
+    return _render_png(fig)
+async def _stream_results(websocket: WebSocket):
     await websocket.accept()
-    last_marker = None
+    queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=4)
+    loop = asyncio.get_running_loop()
+
+    def on_result(item: dict) -> None:
+        def push() -> None:
+            while queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
+
+        loop.call_soon_threadsafe(push)
+
+    listener_id = realtime_controller.add_result_listener(on_result)
     try:
+        latest = realtime_controller.get_latest_result()
+        if latest:
+            await websocket.send_json({"results": [latest]})
+
         while True:
-            lines = realtime_controller.get_results(tail)
-            if last_marker is None:
-                to_send = lines
-            else:
-                last_index = _find_marker(lines, last_marker)
-                if last_index >= 0:
-                    to_send = lines[last_index + 1 :]
-                else:
-                    to_send = lines
-
-            if to_send:
-                await websocket.send_json({"results": to_send})
-                last = to_send[-1]
-                last_marker = (last.get("ts"), last.get("id"))
-
-            await asyncio.sleep(interval)
+            item = await queue.get()
+            await websocket.send_json({"results": [item]})
     except WebSocketDisconnect:
         return
+    finally:
+        realtime_controller.remove_result_listener(listener_id)
 
 
 class StartRequest(BaseModel):
@@ -81,21 +171,20 @@ def results(tail: int = 50):
     return {"results": realtime_controller.get_results(tail=tail)}
 
 
+@router.get("/plots/range-profile/latest.png")
+def latest_range_profile_plot(_marker: str | None = None):
+    range_plot = _extract_latest_range_plot()
+    image = _profile_png(range_plot) if range_plot else _build_placeholder_png("Waiting for range profile")
+    return Response(content=image, media_type="image/png")
+
+
+@router.get("/plots/range-time/latest.png")
+def latest_range_time_plot(_marker: str | None = None):
+    range_plot = _extract_latest_range_plot()
+    image = _range_time_png(range_plot) if range_plot else _build_placeholder_png("Waiting for range-time")
+    return Response(content=image, media_type="image/png")
+
+
 @router.websocket("/ws/results")
 async def results_ws(websocket: WebSocket):
-    tail_raw = websocket.query_params.get("tail", "50")
-    interval_raw = websocket.query_params.get("interval", "0.5")
-    try:
-        tail = max(10, min(500, int(tail_raw)))
-    except ValueError:
-        tail = 50
-
-    try:
-        interval = float(interval_raw)
-    except ValueError:
-        interval = 0.5
-
-    if interval < 0.1:
-        interval = 0.1
-
-    await _stream_results(websocket, tail=tail, interval=interval)
+    await _stream_results(websocket)

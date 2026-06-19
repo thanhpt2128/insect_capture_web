@@ -372,8 +372,6 @@ def _build_range_plot(
         "clutter_alpha": clutter_alpha,
         "adc_params": _to_builtin(params),
     }
-
-
 class DropOldestQueue:
     """Bounded multiprocessing queue that drops stale items instead of blocking."""
 
@@ -523,6 +521,25 @@ def preprocessing_worker_process(
     import_dependencies()
     print("[+] Preprocessing Process initiated.", flush=True)
 
+    sock = None
+    try:
+        sock = socket.create_connection(
+            (args_dict["server_host"], int(args_dict["server_port"])),
+            timeout=10,
+        )
+        print(
+            f"[+] Preprocessing socket connected to {args_dict['server_host']}:{args_dict['server_port']}",
+            flush=True,
+        )
+        _send_json_line(
+            sock,
+            {"type": "status", "stage": "preprocess", "event": "ready", "ts": time.time()},
+        )
+    except Exception as exc:
+        print(f"[-] Preprocessing socket connection failed: {exc}", flush=True)
+        exit_event.set()
+        return
+
     while not exit_event.is_set():
         try:
             item = preprocess_queue.get(block=True, timeout=1.0)
@@ -540,10 +557,7 @@ def preprocessing_worker_process(
 
         try:
             total_elements = int(getattr(raw_data, "size", 0) or 0)
-            preview_slice_size = min(64, total_elements)
             stat_slice_size = min(8192, total_elements)
-
-            preview_slice = raw_data[:preview_slice_size].tolist() if preview_slice_size else []
             stats_subset = raw_data[:stat_slice_size] if stat_slice_size else raw_data
 
             if stat_slice_size:
@@ -566,7 +580,7 @@ def preprocessing_worker_process(
                 "sample_std": sample_std,
                 "sample_min": sample_min,
                 "sample_max": sample_max,
-                "preview": preview_slice,
+                "preview": [],
             }
 
             try:
@@ -577,10 +591,65 @@ def preprocessing_worker_process(
                     "error": str(exc),
                 }
 
+            preview_payload = {
+                "type": "range_preview",
+                "stage": "preprocess",
+                "mode": "hardware",
+                "seq": int(seq),
+                "ts": float(ts),
+                "com_port": args_dict["com_port"],
+                "cfg_path": args_dict["cfg_path"],
+                "capture": {
+                    "numframes": features["numframes"],
+                    "elapsed_s": float(args_dict["interval"]),
+                    "size": features["size"],
+                    "dtype": features["dtype"],
+                    "sample_n": features["sample_n"],
+                    "sample_mean": features["sample_mean"],
+                    "sample_std": features["sample_std"],
+                    "sample_min": features["sample_min"],
+                    "sample_max": features["sample_max"],
+                },
+                "result": {
+                    "label": "preprocessing-ready",
+                    "score": None,
+                },
+                "range_plot": features.get("range_plot"),
+                "preview": [],
+                "note": "DSP preview emitted before AI inference.",
+            }
+
+            try:
+                _send_json_line(sock, preview_payload)
+            except Exception as exc:
+                print(
+                    f"[!] Preprocessing preview send failed: {exc}. Initiating teardown...",
+                    flush=True,
+                )
+                exit_event.set()
+                break
+
             ai_queue.put((seq, ts, features))
         except Exception as exc:
             print(f"[-] Preprocessing failure at sequence {seq}: {exc}", flush=True)
             traceback.print_exc()
+
+    if sock is not None:
+        try:
+            _send_json_line(
+                sock,
+                {"type": "status", "stage": "preprocess", "event": "stopped", "ts": time.time()},
+            )
+        except Exception:
+            pass
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
 
     print("[+] Preprocessing Process terminated.", flush=True)
 
@@ -604,7 +673,10 @@ def ai_worker_process(
             f"[+] TCP Connection verified with {args_dict['server_host']}:{args_dict['server_port']}",
             flush=True,
         )
-        _send_json_line(sock, {"type": "status", "event": "ready", "ts": time.time()})
+        _send_json_line(
+            sock,
+            {"type": "status", "stage": "inference", "event": "ready", "ts": time.time()},
+        )
     except Exception as exc:
         print(f"[-] Connection to FastAPI server failed: {exc}", flush=True)
         exit_event.set()
@@ -627,7 +699,8 @@ def ai_worker_process(
             }
 
             payload = {
-                "type": "range_dsp" if features.get("range_plot") else "inference",
+                "type": "inference",
+                "stage": "inference",
                 "mode": "hardware",
                 "seq": int(seq),
                 "ts": float(ts),
@@ -670,7 +743,10 @@ def ai_worker_process(
     finally:
         if sock is not None:
             try:
-                _send_json_line(sock, {"type": "status", "event": "stopped", "ts": time.time()})
+                _send_json_line(
+                    sock,
+                    {"type": "status", "stage": "inference", "event": "stopped", "ts": time.time()},
+                )
             except Exception:
                 pass
             try:
@@ -697,7 +773,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dca-cfg", type=str, default="cf.json")
     parser.add_argument("--numframes", type=int, default=30)
     parser.add_argument("--frame-num-in-buf", type=int, default=128)
-    parser.add_argument("--interval", type=float, default=0.5)
+    parser.add_argument("--interval", type=float, default=0.0)
     parser.add_argument("--preprocess-queue-size", type=int, default=10)
     parser.add_argument("--ai-queue-size", type=int, default=10)
     parser.add_argument("--range-fft-size", type=int, default=0)
