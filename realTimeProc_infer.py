@@ -361,6 +361,7 @@ def preprocessing_worker_process(
     preprocess_queue: DropOldestQueue,
     ai_queue: DropOldestQueue,
     args_dict: Dict[str, Any],
+    plot_queue: Optional["DropOldestQueue"] = None,
 ) -> None:
     """Process 2: DSP pipeline — Range-FFT, STFT, feature extraction via InsectRadarProcessor."""
     import_dependencies()
@@ -438,6 +439,16 @@ def preprocessing_worker_process(
                 }
 
                 ai_queue.put((seq, ts, proc_result))
+
+                # Feed the local matplotlib viewer with the raw Range-Time Map
+                # (same data as the web), if the local view is enabled.
+                if plot_queue is not None:
+                    try:
+                        rtm = np.asarray(result["viz"]["rtm_db"], dtype=np.float32)
+                        plot_queue.put((int(seq), rtm, bool(result["is_insect"]),
+                                        float(result["power_threshold"])))
+                    except Exception:
+                        pass
 
             except Exception as exc:
                 print(f"[-] Preprocessing failure at seq={seq}: {exc}", flush=True)
@@ -618,6 +629,106 @@ def ai_worker_process(
         print("[+] AI Worker Process terminated.", flush=True)
 
 
+def plot_worker_process(
+    exit_event: multiprocessing.Event,
+    plot_queue: "DropOldestQueue",
+    args_dict: Dict[str, Any],
+) -> None:
+    """Optional Process 4: live local matplotlib view (range-time waterfall +
+    range-profile) drawn from the SAME Range-Time Map the web stream uses.
+
+    Runs in its own process so the GUI event loop never blocks the DSP/AI path.
+    Any failure (e.g. no display) is non-fatal: it just disables the local view
+    without tearing down the pipeline.
+    """
+    try:
+        import numpy as np_local
+        import matplotlib
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation
+        from insect_radar_processor.insect_radar_processor import RadarConfig
+    except Exception as exc:
+        print(f"[!] Local view disabled (import failed: {exc}).", flush=True)
+        return
+
+    try:
+        cfg = RadarConfig()
+        range_res = float(cfg.range_resolution)
+        n_bins = int(cfg.n_range_bins_keep)
+        history = max(int(args_dict.get("view_history", 300)), n_bins)
+        max_range = n_bins * range_res
+
+        buf = np_local.full((n_bins, history), np_local.nan, dtype=np_local.float32)
+        range_axis = np_local.arange(n_bins) * range_res
+
+        plt.style.use("dark_background")
+        fig, (ax_wf, ax_prof) = plt.subplots(2, 1, figsize=(9, 6))
+        try:
+            fig.canvas.manager.set_window_title("pyRadar — live range-time / range-profile")
+        except Exception:
+            pass
+        im = ax_wf.imshow(buf, aspect="auto", origin="lower", cmap="viridis",
+                          extent=[0, history, 0, max_range], vmin=0, vmax=1,
+                          interpolation="nearest")
+        ax_wf.set_ylabel("Range (m)")
+        ax_wf.set_xlabel("Time (frames)")
+        fig.colorbar(im, ax=ax_wf, label="dB")
+        (line,) = ax_prof.plot(range_axis, np_local.zeros(n_bins), color="#38bdf8", lw=1.8)
+        (peak_pt,) = ax_prof.plot([], [], "o", color="#fde047", ms=7)
+        ax_prof.set_xlim(0, max_range)
+        ax_prof.set_xlabel("Range (m)")
+        ax_prof.set_ylabel("Amplitude (dB)")
+        ax_prof.grid(True, alpha=0.3)
+    except Exception as exc:
+        print(f"[!] Local view disabled (figure init failed: {exc}).", flush=True)
+        return
+
+    print("[+] Local view window opened.", flush=True)
+
+    def update(_frame):
+        if exit_event.is_set():
+            plt.close("all")
+            return
+        latest = None
+        while True:
+            try:
+                latest = plot_queue.get(block=False)
+            except Empty:
+                break
+            except Exception:
+                break
+        if latest is None:
+            return
+        seq, rtm, is_insect, power = latest
+        rtm = np_local.asarray(rtm, dtype=np_local.float32)
+        k = rtm.shape[0]
+        nonlocal buf
+        buf = np_local.roll(buf, -k, axis=1)
+        buf[:, -k:] = rtm.T
+        finite = buf[np_local.isfinite(buf)]
+        if finite.size >= 16:
+            vmin = float(np_local.percentile(finite, 5))
+            vmax = float(np_local.percentile(finite, 99))
+            im.set_clim(vmin, vmax)
+        im.set_data(buf)
+        profile = np_local.nanmean(rtm, axis=0)
+        line.set_ydata(profile)
+        ax_prof.set_ylim(float(np_local.min(profile)) - 1, float(np_local.max(profile)) + 1)
+        pk = int(np_local.argmax(profile))
+        peak_pt.set_data([range_axis[pk]], [profile[pk]])
+        label = "insect" if is_insect else "background"
+        ax_wf.set_title(f"seq={seq}  {label}  power={power:,.0f}  peak={range_axis[pk]:.2f} m",
+                        fontsize=10)
+
+    try:
+        _anim = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
+        plt.show()
+    except Exception as exc:
+        print(f"[!] Local view closed: {exc}", flush=True)
+    finally:
+        print("[+] Local view process terminated.", flush=True)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="High-throughput decoupled multi-process radar pipeline."
@@ -628,9 +739,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cli-baud", type=int, default=921600)
     parser.add_argument("--cfg-path", type=str, required=True)
     parser.add_argument("--dca-cfg", type=str, default="cf.json")
-    parser.add_argument("--numframes", type=int, default=1)
+    parser.add_argument("--numframes", type=int, default=30)
     parser.add_argument("--frame-num-in-buf", type=int, default=128)
-    parser.add_argument("--interval", type=float, default=0.5)
+    # 0 = no artificial pacing; the client coalesces draws via requestAnimationFrame,
+    # so a server-side sleep only adds latency and backlog.
+    parser.add_argument("--interval", type=float, default=0.0)
     parser.add_argument("--preprocess-queue-size", type=int, default=10)
     parser.add_argument("--ai-queue-size", type=int, default=10)
     parser.add_argument("--model", type=str, default="svm",
@@ -640,6 +753,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="range_bin_min for InsectRadarProcessor (default: 15)")
     parser.add_argument("--range-bin-max", type=int, default=20,
                         help="range_bin_max for InsectRadarProcessor (default: 20)")
+    parser.add_argument("--local-view", action=argparse.BooleanOptionalAction, default=True,
+                        help="open a local matplotlib range-time/range-profile window alongside the web stream")
+    parser.add_argument("--view-history", type=int, default=300,
+                        help="local waterfall width in frames (default: 300)")
 
     args = parser.parse_args(argv)
     args_dict = vars(args)
@@ -652,6 +769,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     exit_event = multiprocessing.Event()
     preprocess_queue = DropOldestQueue(maxsize=max(1, int(args.preprocess_queue_size)))
     ai_queue = DropOldestQueue(maxsize=max(1, int(args.ai_queue_size)))
+    plot_queue = DropOldestQueue(maxsize=2) if args.local_view else None
 
     def signal_handler(signum: int, _frame: Any) -> None:
         print(
@@ -672,7 +790,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     preprocess_proc = multiprocessing.Process(
         target=preprocessing_worker_process,
-        args=(exit_event, preprocess_queue, ai_queue, args_dict),
+        args=(exit_event, preprocess_queue, ai_queue, args_dict, plot_queue),
         name="DSPPreprocessingProcess",
     )
     ai_proc = multiprocessing.Process(
@@ -681,6 +799,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         name="InferenceProcess",
     )
     processes = [capture_proc, preprocess_proc, ai_proc]
+
+    if args.local_view and plot_queue is not None:
+        plot_proc = multiprocessing.Process(
+            target=plot_worker_process,
+            args=(exit_event, plot_queue, args_dict),
+            name="LocalViewProcess",
+        )
+        processes.append(plot_proc)
 
     print("[*] Decoupled multi-process radar pipeline initializing...", flush=True)
     for proc in processes:
@@ -712,6 +838,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     preprocess_queue.close()
     ai_queue.close()
+    if plot_queue is not None:
+        plot_queue.close()
 
     print("[*] Pipeline system fully stopped.", flush=True)
     return 0
