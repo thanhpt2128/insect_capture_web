@@ -174,6 +174,49 @@ def _frame_int16_from_cfg(cfg_path: str) -> Optional[int]:
     return int(loops) * chirps_per_loop * num_rx * int(samples) * 2
 
 
+def _build_range_plot(result: Dict[str, Any], range_resolution_m: float) -> Optional[Dict[str, Any]]:
+    """Build the web-compatible range_plot dict from InsectRadarProcessor viz.
+
+    Reuses the Range-Time Map (rtm_db, shape [n_frames, n_range_bins]) the
+    processor already computed. The 1-D range profile is the mean over the
+    frames in the batch. Schema matches what app.js / the PNG endpoints expect:
+    range_profile (1-D), range_time (2-D), min_db/max_db, frame_count, range_bins.
+    """
+    viz = result.get("viz") or {}
+    rtm = viz.get("rtm_db")
+    if rtm is None:
+        return None
+
+    rtm = np.asarray(rtm, dtype=np.float32)
+    if rtm.ndim != 2 or rtm.size == 0:
+        return None
+
+    n_frames, n_bins = rtm.shape
+    profile = rtm.mean(axis=0)
+    finite = rtm[np.isfinite(rtm)]
+    min_db = float(np.min(finite)) if finite.size else 0.0
+    max_db = float(np.max(finite)) if finite.size else 1.0
+
+    def _round_row(row: Any) -> List[float]:
+        return [round(float(v), 3) for v in np.asarray(row).ravel().tolist()]
+
+    bin_min = viz.get("range_bin_min")
+    bin_max = viz.get("range_bin_max")
+    return {
+        "ready": True,
+        "frame_count": int(n_frames),
+        "range_bins": int(n_bins),
+        "bin": list(range(int(n_bins))),
+        "range_profile": _round_row(profile),
+        "range_time": [_round_row(row) for row in rtm.tolist()],
+        "min_db": round(min_db, 3),
+        "max_db": round(max_db, 3),
+        "range_resolution_m": round(float(range_resolution_m), 6),
+        "range_bin_min": int(bin_min) if bin_min is not None else None,
+        "range_bin_max": int(bin_max) if bin_max is not None else None,
+    }
+
+
 class DropOldestQueue:
     """Bounded multiprocessing queue that drops stale items instead of blocking."""
 
@@ -383,12 +426,15 @@ def preprocessing_worker_process(
                 # no temp-file round-trip on disk.
                 result = processor.process_array(raw_data)
 
-                # Strip viz (heavy numpy arrays) — not needed downstream.
+                # Build the compact range_plot for the UI from the processor's viz,
+                # then drop the heavy viz arrays (spectrogram etc.) before queueing.
+                range_plot = _build_range_plot(result, processor.cfg.range_resolution)
                 proc_result = {
                     "is_insect":       result["is_insect"],
                     "power_threshold": result["power_threshold"],
                     "features":        result["features"],   # None when background
                     "reason":          result.get("reason"), # None when insect
+                    "range_plot":      range_plot,
                 }
 
                 ai_queue.put((seq, ts, proc_result))
@@ -534,6 +580,7 @@ def ai_worker_process(
                 "is_insect":       proc_result["is_insect"],
                 "power_threshold": proc_result["power_threshold"],
                 "result":          ai_result,
+                "range_plot":      proc_result.get("range_plot"),
             }
 
             try:
@@ -581,7 +628,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cli-baud", type=int, default=921600)
     parser.add_argument("--cfg-path", type=str, required=True)
     parser.add_argument("--dca-cfg", type=str, default="cf.json")
-    parser.add_argument("--numframes", type=int, default=30)
+    parser.add_argument("--numframes", type=int, default=1)
     parser.add_argument("--frame-num-in-buf", type=int, default=128)
     parser.add_argument("--interval", type=float, default=0.5)
     parser.add_argument("--preprocess-queue-size", type=int, default=10)

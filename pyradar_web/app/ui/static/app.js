@@ -6,6 +6,8 @@ let rangeProfileChart = null;
 let lastRangeStageRank = -1;
 let lastResultSeq = null;
 let lastResultStageRank = -1;
+let rangeDrawScheduled = false;
+let pendingRangeSeq = null;
 
 async function fetchJson(url, options) {
 	const res = await fetch(url, options);
@@ -245,16 +247,16 @@ function computeHeatmapScale(matrix, fallbackScale) {
 	return { min, max };
 }
 
-function heatmapColors() {
-	return [
-		[0.0, "#16324f"],
-		[0.18, "#1f6f8b"],
-		[0.36, "#38bdf8"],
-		[0.58, "#67e8f9"],
-		[0.78, "#fde047"],
-		[1.0, "#fff7cc"]
-	];
-}
+// Heatmap palette parsed once as (stop, [r,g,b]) so the per-pixel inner loop
+// does no allocation or hex/regex parsing.
+const HEATMAP_PALETTE = [
+	[0.0, [22, 50, 79]],     // #16324f
+	[0.18, [31, 111, 139]],  // #1f6f8b
+	[0.36, [56, 189, 248]],  // #38bdf8
+	[0.58, [103, 232, 249]], // #67e8f9
+	[0.78, [253, 224, 71]],  // #fde047
+	[1.0, [255, 247, 204]]   // #fff7cc
+];
 
 function drawRangeProfile(profile, scale) {
 	if (!ensureCharts()) {
@@ -336,20 +338,19 @@ function drawRangeTime(matrix, scale) {
 		for (let bin = 0; bin < bins; bin += 1) {
 			const value = Number.isFinite(row[bin]) ? row[bin] : scale.min;
 			const normalized = Math.max(0, Math.min(1, (value - scale.min) / span));
-			const palette = heatmapColors();
-			let left = palette[0];
-			let right = palette[palette.length - 1];
-			for (let index = 0; index < palette.length - 1; index += 1) {
-				if (normalized >= palette[index][0] && normalized <= palette[index + 1][0]) {
-					left = palette[index];
-					right = palette[index + 1];
+			let left = HEATMAP_PALETTE[0];
+			let right = HEATMAP_PALETTE[HEATMAP_PALETTE.length - 1];
+			for (let index = 0; index < HEATMAP_PALETTE.length - 1; index += 1) {
+				if (normalized >= HEATMAP_PALETTE[index][0] && normalized <= HEATMAP_PALETTE[index + 1][0]) {
+					left = HEATMAP_PALETTE[index];
+					right = HEATMAP_PALETTE[index + 1];
 					break;
 				}
 			}
 			const localSpan = Math.max(1e-6, right[0] - left[0]);
 			const t = (normalized - left[0]) / localSpan;
-			const leftRgb = left[1].match(/[0-9a-f]{2}/gi).map((hex) => Number.parseInt(hex, 16));
-			const rightRgb = right[1].match(/[0-9a-f]{2}/gi).map((hex) => Number.parseInt(hex, 16));
+			const leftRgb = left[1];
+			const rightRgb = right[1];
 			const rgb = [
 				Math.round(leftRgb[0] + (rightRgb[0] - leftRgb[0]) * t),
 				Math.round(leftRgb[1] + (rightRgb[1] - leftRgb[1]) * t),
@@ -418,6 +419,23 @@ function drawCurrentRangeView(seq) {
 	}
 }
 
+function scheduleRangeDraw(seq) {
+	// Coalesce bursts of messages into a single draw per animation frame so the
+	// main thread never piles up redraws when batches arrive faster than the
+	// display refresh.
+	pendingRangeSeq = seq;
+	if (rangeDrawScheduled) {
+		return;
+	}
+	rangeDrawScheduled = true;
+	const raf =
+		window.requestAnimationFrame || ((cb) => window.setTimeout(() => cb(), 16));
+	raf(() => {
+		rangeDrawScheduled = false;
+		drawCurrentRangeView(pendingRangeSeq);
+	});
+}
+
 function ingestRangePlot(rangePlot, seq, stage) {
 	const meta = document.getElementById("rangeMeta");
 	if (!rangePlot) return;
@@ -435,7 +453,7 @@ function ingestRangePlot(rangePlot, seq, stage) {
 	lastRangePlot = rangePlot;
 	lastRangeSeq = seqNumber;
 	lastRangeStageRank = rank;
-	drawCurrentRangeView(seqNumber);
+	scheduleRangeDraw(seqNumber);
 }
 
 function handleResultItem(item) {
@@ -661,7 +679,7 @@ function wireUi() {
 			rangeProfileChart.resize();
 		}
 		if (lastRangePlot) {
-			drawCurrentRangeView(lastRangeSeq);
+			scheduleRangeDraw(lastRangeSeq);
 		} else {
 			drawHeatmapPlaceholder("Waiting for range-time");
 		}
