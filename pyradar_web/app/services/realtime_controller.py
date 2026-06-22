@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -78,6 +79,15 @@ class RealTimeController:
             host, port = self._server_sock.getsockname()
             self._append_log(f"result socket listening on {host}:{port}")
 
+            # Force UTF-8 on the worker's stdio so non-ASCII prints (e.g. the
+            # "→" in InsectRadarProcessor) do not crash the worker under the
+            # default Windows cp1252 console encoding.
+            worker_env = {
+                **os.environ,
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            }
+
             self._process = subprocess.Popen(
                 [
                     sys.executable,
@@ -99,7 +109,10 @@ class RealTimeController:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
+                env=worker_env,
             )
 
             self._start_time = time.time()

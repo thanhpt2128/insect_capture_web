@@ -50,7 +50,13 @@ function setLatestResultLine(obj) {
 	const dbRange = Number.isFinite(range.min_db) && Number.isFinite(range.max_db)
 		? `${range.min_db.toFixed(1)}..${range.max_db.toFixed(1)} dB`
 		: "n/a";
-	const line = [
+	const result = data.result || {};
+	const probaStr = result.proba && typeof result.proba === "object"
+		? Object.entries(result.proba)
+			.map(([k, v]) => `${k}:${Number(v).toFixed(2)}`)
+			.join(",")
+		: null;
+	const parts = [
 		`seq=${data.seq ?? "-"}`,
 		`stage=${stage}`,
 		`type=${data.type || "-"}`,
@@ -58,9 +64,13 @@ function setLatestResultLine(obj) {
 		`bins=${bins ?? "-"}`,
 		`size=${capture.size ?? "-"}`,
 		`range=${dbRange}`,
-		`result=${data.result && data.result.label ? data.result.label : "-"}`
-	].join(" | ");
-	out.textContent = line;
+		`result=${result.label ? result.label : "-"}`
+	];
+	if (typeof data.is_insect === "boolean") parts.push(`insect=${data.is_insect}`);
+	if (Number.isFinite(data.power_threshold)) parts.push(`power=${data.power_threshold.toFixed(1)}`);
+	if (Number.isFinite(result.score)) parts.push(`score=${result.score.toFixed(3)}`);
+	if (probaStr) parts.push(`proba=[${probaStr}]`);
+	out.textContent = parts.join(" | ");
 	out.scrollTop = out.scrollHeight;
 }
 
