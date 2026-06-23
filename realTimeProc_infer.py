@@ -649,12 +649,17 @@ def ai_worker_process(
                 "TB_CONNECTED", f"{TB_HOST}:{TB_PORT} rc={rc}")
             tb_client.on_disconnect = lambda *a: log_event(
                 "TB_DISCONNECTED", f"{TB_HOST}:{TB_PORT}")
-            tb_client.connect(TB_HOST, TB_PORT, keepalive=60)
+            # Tự kết nối lại khi rớt mạng/WiFi: backoff 1s→60s. Dùng connect_async để
+            # luồng loop_start liên tục thử kết nối — kể cả lần đầu thất bại (WiFi
+            # chưa sẵn sàng lúc khởi động) cũng tự phục hồi khi mạng trở lại, thay vì
+            # tắt hẳn ThingsBoard cho cả phiên.
+            tb_client.reconnect_delay_set(min_delay=1, max_delay=60)
+            tb_client.connect_async(TB_HOST, TB_PORT, keepalive=60)
             tb_client.loop_start()
-            print(f"[+] ThingsBoard MQTT connected: {TB_HOST}:{TB_PORT}, topic '{TB_TOPIC}'.",
-                  flush=True)
+            print(f"[+] ThingsBoard MQTT đang kết nối tới {TB_HOST}:{TB_PORT}, topic '{TB_TOPIC}' "
+                  "(tự kết nối lại khi rớt mạng).", flush=True)
         except Exception as exc:
-            print(f"[!] ThingsBoard MQTT connect failed: {exc} (bỏ qua, vẫn chạy luồng web).",
+            print(f"[!] ThingsBoard MQTT setup failed: {exc} (bỏ qua, vẫn chạy luồng chính).",
                   flush=True)
             log_event("TB_CONNECT_FAILED", str(exc))
             tb_client = None
