@@ -22,6 +22,17 @@ TI = None
 # 1 TX × 4 RX × 128 ADC samples × 128 loops × 2 (I+Q) = 131 072
 _INT16_PER_FRAME = 131_072
 
+# ─────────────────────────────────────────────────────────────────────────
+# ThingsBoard (hard-code — file dùng riêng cá nhân). Điền HOST và TOKEN vào đây.
+# Đặt TB_ENABLE = False để tắt gửi mà vẫn chạy luồng web bình thường.
+# ─────────────────────────────────────────────────────────────────────────
+TB_ENABLE = True
+TB_HOST   = "REPLACE_WITH_THINGSBOARD_HOST"   # ví dụ: "mqtt.thingsboard.cloud"
+TB_PORT   = 1883
+TB_TOKEN  = "REPLACE_WITH_ACCESS_TOKEN"
+TB_TOPIC  = "v1/devices/me/telemetry"
+TB_QOS    = 1
+
 
 def import_dependencies() -> None:
     """Import scientific and hardware packages within the process context."""
@@ -500,6 +511,27 @@ def ai_worker_process(
         exit_event.set()
         return
 
+    # ── ThingsBoard MQTT (chạy song song luồng TCP→FastAPI, lỗi không làm sập web) ──
+    tb_client = None
+    if TB_ENABLE and "REPLACE_WITH" not in TB_HOST and "REPLACE_WITH" not in TB_TOKEN:
+        try:
+            import paho.mqtt.client as mqtt
+            tb_client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                client_id=f"insect_rt_{int(time.time())}",
+            )
+            tb_client.username_pw_set(TB_TOKEN)
+            tb_client.connect(TB_HOST, TB_PORT, keepalive=60)
+            tb_client.loop_start()
+            print(f"[+] ThingsBoard MQTT connected: {TB_HOST}:{TB_PORT}, topic '{TB_TOPIC}'.",
+                  flush=True)
+        except Exception as exc:
+            print(f"[!] ThingsBoard MQTT connect failed: {exc} (bỏ qua, vẫn chạy luồng web).",
+                  flush=True)
+            tb_client = None
+    else:
+        print("[*] ThingsBoard tắt (TB_ENABLE=False hoặc chưa điền HOST/TOKEN).", flush=True)
+
     try:
         while not exit_event.is_set():
             readable, _, _ = select.select([sock], [], [], 0)
@@ -604,6 +636,25 @@ def ai_worker_process(
                 exit_event.set()
                 break
 
+            # ── Đẩy kết quả lên ThingsBoard (telemetry ts = thời điểm thu lô raw) ──
+            if tb_client is not None:
+                try:
+                    tb_values = {
+                        "seq":             int(seq),
+                        "capture_ts":      float(ts),   # mốc lô raw tại luồng nhận
+                        "is_insect":       proc_result["is_insect"],
+                        "power_threshold": proc_result["power_threshold"],
+                        "label":           ai_result.get("label"),
+                        "score":           ai_result.get("score"),
+                    }
+                    if ai_result.get("proba"):
+                        for _cls, _v in ai_result["proba"].items():
+                            tb_values[f"proba_{_cls}"] = float(_v)
+                    tb_msg = {"ts": int(float(ts) * 1000), "values": _to_builtin(tb_values)}
+                    tb_client.publish(TB_TOPIC, json.dumps(tb_msg, ensure_ascii=False), qos=TB_QOS)
+                except Exception as exc:
+                    print(f"[!] ThingsBoard publish failed at seq={seq}: {exc}", flush=True)
+
             if float(args_dict["interval"]) > 0:
                 time.sleep(float(args_dict["interval"]))
 
@@ -612,6 +663,12 @@ def ai_worker_process(
         traceback.print_exc()
         exit_event.set()
     finally:
+        if tb_client is not None:
+            try:
+                tb_client.loop_stop()
+                tb_client.disconnect()
+            except Exception:
+                pass
         if sock is not None:
             try:
                 _send_json_line(sock, {"type": "status", "event": "stopped", "ts": time.time()})
