@@ -4,6 +4,7 @@ import multiprocessing
 import select
 import signal
 import socket
+import sqlite3
 import sys
 import time
 import traceback
@@ -40,6 +41,101 @@ TB_PORT   = 1883
 TB_TOKEN  = "REPLACE_WITH_ACCESS_TOKEN"
 TB_TOPIC  = "v1/devices/me/telemetry"
 TB_QOS    = 1
+
+# ─────────────────────────────────────────────────────────────────────────
+# Nhật ký sự kiện (file txt cố định, ghi nối tiếp mỗi lần chạy) và cơ sở dữ
+# liệu SQLite lưu kết quả phát hiện (chỉ ghi khi nhãn thay đổi). Cả hai đặt
+# trong thư mục logs/ cạnh file mã nguồn này.
+# ─────────────────────────────────────────────────────────────────────────
+LOG_DIR        = Path(__file__).resolve().parent / "logs"
+EVENT_LOG_PATH = LOG_DIR / "realtime_events.log"
+DB_PATH        = LOG_DIR / "detections.db"
+DB_MAX_BYTES   = 1024 * 1024 * 1024          # 1 GB: vượt ngưỡng thì xoá dần bản ghi cũ nhất
+
+
+def log_event(event: str, detail: str = "") -> None:
+    """Ghi một dòng sự kiện vào file log cố định: [EVENT] thời_gian | chi tiết.
+
+    Mở/đóng theo từng lần ghi để an toàn khi nhiều tiến trình cùng nối tiếp:
+    các dòng ngắn ở chế độ append nên không tranh chấp đáng kể."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{event}] {stamp}" + (f" | {detail}" if detail else "")
+        with open(EVENT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def open_detection_db() -> Optional["sqlite3.Connection"]:
+    """Mở (tạo nếu chưa có) DB SQLite và bảng detections lưu kết quả phát hiện."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS detections ("
+            "  id    INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  ts    REAL,"          # mốc thời gian lô raw, đồng nhất với 'ts' gửi GUI
+            "  label TEXT,"
+            "  power REAL,"
+            "  score REAL,"
+            "  proba TEXT)"          # JSON phân phối xác suất theo lớp (NULL khi nền)
+        )
+        conn.commit()
+        return conn
+    except Exception as exc:
+        print(f"[!] Không mở được SQLite '{DB_PATH}': {exc}", flush=True)
+        return None
+
+
+def _enforce_db_size_cap(conn: "sqlite3.Connection") -> None:
+    """Khi file DB vượt 1 GB, xoá dần ~10% bản ghi cũ nhất rồi VACUUM thu hồi dung lượng."""
+    try:
+        if not DB_PATH.exists() or DB_PATH.stat().st_size < DB_MAX_BYTES:
+            return
+        total = int(conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0])
+        if total <= 0:
+            return
+        ndel = max(1, total // 10)
+        conn.execute(
+            "DELETE FROM detections WHERE id IN "
+            "(SELECT id FROM detections ORDER BY id ASC LIMIT ?)",
+            (ndel,),
+        )
+        conn.commit()
+        conn.execute("VACUUM")
+        log_event("DB_TRIMMED", f"xoá {ndel} ban ghi cu nhat (DB > 1GB)")
+    except Exception as exc:
+        print(f"[!] Lỗi cắt bớt DB: {exc}", flush=True)
+
+
+def insert_detection(
+    conn: "sqlite3.Connection",
+    ts: float,
+    label: str,
+    power: Optional[float],
+    score: Optional[float],
+    proba: Optional[Dict[str, Any]],
+) -> None:
+    """Chèn một bản ghi phát hiện (việc kiểm tra nhãn thay đổi do nơi gọi đảm nhận).
+
+    Trước khi chèn, kiểm tra ngưỡng dung lượng 1 GB và xoá dần bản ghi cũ nếu cần."""
+    try:
+        _enforce_db_size_cap(conn)
+        conn.execute(
+            "INSERT INTO detections (ts, label, power, score, proba) VALUES (?,?,?,?,?)",
+            (
+                float(ts),
+                str(label),
+                float(power) if power is not None else None,
+                float(score) if score is not None else None,
+                json.dumps(_to_builtin(proba), ensure_ascii=False) if proba is not None else None,
+            ),
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[!] Lỗi ghi DB tại label={label}: {exc}", flush=True)
 
 
 def import_dependencies() -> None:
@@ -289,6 +385,7 @@ def capture_worker_process(
         dca_json_path = _resolve_repo_path(str(args_dict["dca_cfg"]), default_dir="configFiles")
 
         print(f"[+] Resolving Configs: Radar={cfg_path}, DCA={dca_json_path}", flush=True)
+        log_event("CFG_SELECTED", f"cfg={cfg_path}; dca={dca_json_path}")
 
         dca = DCA1000()
         try:
@@ -325,6 +422,8 @@ def capture_worker_process(
         dca.fastRead_in_Cpp_thread_start(max_buffer_size)
         radar.startSensor()
         print("[+] Hardware started. Capturing UDP data...", flush=True)
+        log_event("CAPTURE_START",
+                  f"com={args_dict['com_port']}; numframes={args_dict['numframes']}")
 
         seq = 0
         while not exit_event.is_set():
@@ -345,9 +444,11 @@ def capture_worker_process(
     except Exception as exc:
         print(f"[-] Exception occurred in Capture Process: {exc}", flush=True)
         traceback.print_exc()
+        log_event("CAPTURE_ERROR", str(exc))
         exit_event.set()
     finally:
         print("[+] Halting hardware systems and releasing ports...", flush=True)
+        log_event("CAPTURE_STOP")
         if radar is not None:
             try:
                 radar.stopSensor()
@@ -497,10 +598,18 @@ def ai_worker_process(
         model = joblib.load(models_dir / model_files[model_name])
         feature_names = joblib.load(models_dir / "feature_names.pkl")
         print(f"[+] Model '{model_name}' loaded ({len(feature_names)} features).", flush=True)
+        log_event("MODEL_LOADED", f"model={model_name}; features={len(feature_names)}")
     except Exception as exc:
         print(f"[-] Failed to load model '{model_name}': {exc}", flush=True)
+        log_event("MODEL_LOAD_FAILED", f"model={model_name}: {exc}")
         exit_event.set()
         return
+
+    # CSDL SQLite + theo dõi nhãn gần nhất đã ghi (chỉ ghi khi nhãn thay đổi).
+    db_conn = open_detection_db()
+    last_db_label: Optional[str] = None
+    if db_conn is not None:
+        print(f"[+] SQLite detections DB: {DB_PATH}", flush=True)
 
     standalone = bool(args_dict.get("standalone"))
     sock = None
@@ -535,6 +644,11 @@ def ai_worker_process(
                 client_id=f"insect_rt_{int(time.time())}",
             )
             tb_client.username_pw_set(TB_TOKEN)
+            # Ghi nhật ký mỗi lần kết nối/mất kết nối (kể cả khi paho tự kết nối lại).
+            tb_client.on_connect = lambda c, u, f, rc, p=None: log_event(
+                "TB_CONNECTED", f"{TB_HOST}:{TB_PORT} rc={rc}")
+            tb_client.on_disconnect = lambda *a: log_event(
+                "TB_DISCONNECTED", f"{TB_HOST}:{TB_PORT}")
             tb_client.connect(TB_HOST, TB_PORT, keepalive=60)
             tb_client.loop_start()
             print(f"[+] ThingsBoard MQTT connected: {TB_HOST}:{TB_PORT}, topic '{TB_TOPIC}'.",
@@ -542,9 +656,11 @@ def ai_worker_process(
         except Exception as exc:
             print(f"[!] ThingsBoard MQTT connect failed: {exc} (bỏ qua, vẫn chạy luồng web).",
                   flush=True)
+            log_event("TB_CONNECT_FAILED", str(exc))
             tb_client = None
     else:
         print("[*] ThingsBoard tắt (TB_ENABLE=False hoặc chưa điền HOST/TOKEN).", flush=True)
+        log_event("TB_DISABLED", "TB_ENABLE=False hoac chua dien HOST/TOKEN")
 
     try:
         while not exit_event.is_set():
@@ -564,6 +680,7 @@ def ai_worker_process(
                     for message in messages:
                         if str(message.get("cmd", "")).lower() == "stop":
                             print("[*] Stop command received from FastAPI controller.", flush=True)
+                            log_event("STOP_COMMAND", "tu GUI/web controller")
                             try:
                                 _send_json_line(
                                     sock,
@@ -680,6 +797,22 @@ def ai_worker_process(
                 except Exception as exc:
                     print(f"[!] ThingsBoard publish failed at seq={seq}: {exc}", flush=True)
 
+            # ── Lưu vào SQLite KHI NHÃN PHÁT HIỆN THAY ĐỔI (bỏ qua nhãn 'error') ──
+            if db_conn is not None:
+                cur_label = ai_result.get("label")
+                if cur_label and cur_label != "error" and cur_label != last_db_label:
+                    insert_detection(
+                        db_conn,
+                        ts=float(ts),                               # đồng nhất với 'ts' gửi GUI
+                        label=cur_label,
+                        power=proc_result.get("power_threshold"),
+                        score=ai_result.get("score"),
+                        proba=ai_result.get("proba"),
+                    )
+                    log_event("DETECTION_CHANGE",
+                              f"label={cur_label}; score={ai_result.get('score')}")
+                    last_db_label = cur_label
+
             if float(args_dict["interval"]) > 0:
                 time.sleep(float(args_dict["interval"]))
 
@@ -688,6 +821,11 @@ def ai_worker_process(
         traceback.print_exc()
         exit_event.set()
     finally:
+        if db_conn is not None:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
         if tb_client is not None:
             try:
                 tb_client.loop_stop()
@@ -895,6 +1033,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         processes.append(plot_proc)
 
     print("[*] Decoupled multi-process radar pipeline initializing...", flush=True)
+    log_event(
+        "PIPELINE_INIT",
+        f"cfg={args_dict['cfg_path']}; com={args_dict['com_port']}; "
+        f"model={args_dict['model']}; standalone={args_dict.get('standalone')}",
+    )
     for proc in processes:
         proc.start()
 
@@ -928,6 +1071,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         plot_queue.close()
 
     print("[*] Pipeline system fully stopped.", flush=True)
+    log_event("PIPELINE_STOP")
     return 0
 
 
