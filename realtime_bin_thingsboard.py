@@ -30,6 +30,7 @@ màn hình thay vì publish (tiện kiểm thử pipeline mà chưa có thông t
 """
 
 import argparse
+import csv
 import json
 import multiprocessing
 import signal
@@ -223,11 +224,22 @@ class DropOldestQueue:
             pass
 
 
+def _wait_ready(ready_barrier: Any, exit_event: multiprocessing.Event,
+                timeout: float = 120.0) -> None:
+    """Chờ ở rào đồng bộ tới khi cả 3 tiến trình khởi tạo xong (hoặc lỗi/timeout)."""
+    try:
+        ready_barrier.wait(timeout=timeout)
+    except Exception:
+        # BrokenBarrierError / timeout → coi như có lỗi khởi tạo, dừng pipeline.
+        exit_event.set()
+
+
 # ---------------------------------------------------------------------------
 # Process 1 — Capture: trích 30 frame một lần từ file .bin theo chu kỳ.
 # ---------------------------------------------------------------------------
 def capture_worker_process(
     exit_event: multiprocessing.Event,
+    ready_barrier: Any,
     preprocess_queue: DropOldestQueue,
     args_dict: Dict[str, Any],
 ) -> None:
@@ -242,10 +254,19 @@ def capture_worker_process(
     if not Path(bin_path).exists():
         print(f"[-] Bin file not found: {bin_path}", flush=True)
         exit_event.set()
+        try:
+            ready_barrier.abort()
+        except Exception:
+            pass
         return
 
     print(f"[+] Replaying: {bin_path}  (batch = {args_dict['numframes']} frames, "
           f"interval = {interval}s, loop = {loop_file})", flush=True)
+
+    # Chờ DSP và AI sẵn sàng rồi mới đọc lô đầu (tránh warmup làm sai benchmark).
+    _wait_ready(ready_barrier, exit_event)
+    if exit_event.is_set():
+        return
 
     seq = 0
     try:
@@ -286,6 +307,7 @@ def capture_worker_process(
 # ---------------------------------------------------------------------------
 def preprocessing_worker_process(
     exit_event: multiprocessing.Event,
+    ready_barrier: Any,
     preprocess_queue: DropOldestQueue,
     ai_queue: DropOldestQueue,
     args_dict: Dict[str, Any],
@@ -314,6 +336,9 @@ def preprocessing_worker_process(
         range_bin_max=int(args_dict.get("range_bin_max", 20)),
         iq_order="IIQQ",
     )
+
+    # Báo đã sẵn sàng và chờ các tiến trình khác.
+    _wait_ready(ready_barrier, exit_event)
 
     try:
         while not exit_event.is_set():
@@ -363,6 +388,7 @@ def preprocessing_worker_process(
 # ---------------------------------------------------------------------------
 def ai_worker_process(
     exit_event: multiprocessing.Event,
+    ready_barrier: Any,
     ai_queue: DropOldestQueue,
     args_dict: Dict[str, Any],
 ) -> None:
@@ -413,6 +439,29 @@ def ai_worker_process(
             print(f"[-] MQTT connect failed: {exc} → chuyển sang DRY-RUN.", flush=True)
             client = None
             dry_run = True
+
+    # ── Benchmark CSV: thời gian xử lý mỗi lô từ lúc nhận tới khi AI ra kết quả ──
+    bench_path = args_dict.get("bench_csv")
+    bench_file = None
+    bench_writer = None
+    bench_samples: List[tuple] = []   # (seq, proc_ms)
+    if bench_path:
+        try:
+            bench_file = open(bench_path, "w", newline="", encoding="utf-8")
+            bench_writer = csv.writer(bench_file)
+            bench_writer.writerow(
+                ["seq", "capture_ts", "infer_done_ts", "proc_time_ms",
+                 "is_insect", "label", "score"]
+            )
+            bench_file.flush()
+            print(f"[+] Benchmark CSV: {bench_path}", flush=True)
+        except Exception as exc:
+            print(f"[!] Không mở được benchmark CSV: {exc}", flush=True)
+            bench_file = None
+            bench_writer = None
+
+    # Báo đã sẵn sàng (model + MQTT + CSV) và chờ các tiến trình khác.
+    _wait_ready(ready_barrier, exit_event)
 
     try:
         while not exit_event.is_set():
@@ -468,6 +517,21 @@ def ai_worker_process(
                 traceback.print_exc()
                 ai_result = {"label": "error", "score": None, "proba": None}
 
+            # ── Benchmark: từ lúc nhận lô (ts) đến khi AI ra kết quả ──────
+            infer_done = time.time()
+            proc_ms = (infer_done - float(ts)) * 1000.0
+            if bench_writer is not None and bench_file is not None:
+                try:
+                    bench_writer.writerow([
+                        int(seq), f"{float(ts):.6f}", f"{infer_done:.6f}",
+                        f"{proc_ms:.3f}", bool(proc_result["is_insect"]),
+                        ai_result.get("label"), ai_result.get("score"),
+                    ])
+                    bench_file.flush()
+                    bench_samples.append((int(seq), proc_ms))
+                except Exception:
+                    pass
+
             # ── Đóng gói telemetry cho ThingsBoard ───────────────────────
             # Các trường kết quả hiện có + capture_ts (mốc thời gian lô raw tại luồng nhận).
             values: Dict[str, Any] = {
@@ -501,6 +565,26 @@ def ai_worker_process(
         traceback.print_exc()
         exit_event.set()
     finally:
+        # ── Thống kê cuối file benchmark ─────────────────────────────────
+        if bench_writer is not None and bench_file is not None:
+            try:
+                if bench_samples:
+                    times = [t for _, t in bench_samples]
+                    max_seq, max_ms = max(bench_samples, key=lambda x: x[1])
+                    avg_ms = sum(times) / len(times)
+                    bench_writer.writerow([])
+                    bench_writer.writerow(["SUMMARY"])
+                    bench_writer.writerow(["num_samples", len(bench_samples)])
+                    bench_writer.writerow(["max_proc_time_ms", f"{max_ms:.3f}", "at_seq", max_seq])
+                    bench_writer.writerow(["avg_proc_time_ms", f"{avg_ms:.3f}"])
+                    print(f"[+] Benchmark: {len(bench_samples)} mẫu, "
+                          f"trung bình={avg_ms:.2f} ms, lâu nhất={max_ms:.2f} ms (seq {max_seq}).",
+                          flush=True)
+                bench_file.flush()
+                bench_file.close()
+            except Exception as exc:
+                print(f"[!] Lỗi ghi summary benchmark: {exc}", flush=True)
+
         if client is not None:
             try:
                 client.loop_stop()
@@ -545,15 +629,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     args_dict["bin_path"] = _resolve_repo_path(str(args_dict["bin_path"]), default_dir="data_parse")
     args_dict["cfg_path"] = _resolve_repo_path(str(args_dict["cfg_path"]), default_dir="configFiles")
 
+    # Tên file benchmark = thời điểm chạy chương trình, lưu trong data_parse/.
+    run_label = time.strftime("%Y-%m-%d_%H-%M-%S")
+    bench_dir = Path(__file__).resolve().parent / "data_parse"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    args_dict["bench_csv"] = str(bench_dir / f"{run_label}.csv")
+
     multiprocessing.freeze_support()
 
     exit_event = multiprocessing.Event()
+    # Rào đồng bộ: cả 3 tiến trình khởi tạo xong (import nặng, nạp model, kết nối)
+    # mới cùng bắt đầu vòng lặp → benchmark "nhận → kết quả" không dính thời gian
+    # warmup/queue dồn ở những lô đầu.
+    ready_barrier = multiprocessing.Barrier(3)
     preprocess_queue = DropOldestQueue(maxsize=max(1, int(args.preprocess_queue_size)))
     ai_queue = DropOldestQueue(maxsize=max(1, int(args.ai_queue_size)))
 
     def signal_handler(signum: int, _frame: Any) -> None:
         print(f"[!] Signal {signum} caught. Stopping all subprocesses...", flush=True)
         exit_event.set()
+        try:
+            ready_barrier.abort()
+        except Exception:
+            pass
 
     signal.signal(signal.SIGINT, signal_handler)
     if hasattr(signal, "SIGTERM"):
@@ -561,17 +659,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     capture_proc = multiprocessing.Process(
         target=capture_worker_process,
-        args=(exit_event, preprocess_queue, args_dict),
+        args=(exit_event, ready_barrier, preprocess_queue, args_dict),
         name="BinReplayCaptureProcess",
     )
     preprocess_proc = multiprocessing.Process(
         target=preprocessing_worker_process,
-        args=(exit_event, preprocess_queue, ai_queue, args_dict),
+        args=(exit_event, ready_barrier, preprocess_queue, ai_queue, args_dict),
         name="DSPPreprocessingProcess",
     )
     ai_proc = multiprocessing.Process(
         target=ai_worker_process,
-        args=(exit_event, ai_queue, args_dict),
+        args=(exit_event, ready_barrier, ai_queue, args_dict),
         name="InferenceThingsBoardProcess",
     )
     processes = [capture_proc, preprocess_proc, ai_proc]

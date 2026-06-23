@@ -11,6 +11,14 @@ from pathlib import Path
 from queue import Empty, Full
 from typing import Any, Dict, List, Optional
 
+# Ép UTF-8 cho stdout/stderr (mọi tiến trình con re-import module này), tránh
+# UnicodeEncodeError khi chạy trực tiếp/standalone trên console Windows cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 
 # Import these inside worker processes. This keeps Windows spawn from trying to
 # serialize hardware/C++ handles created at module import time.
@@ -494,22 +502,28 @@ def ai_worker_process(
         exit_event.set()
         return
 
+    standalone = bool(args_dict.get("standalone"))
     sock = None
     recv_buffer = b""
-    try:
-        sock = socket.create_connection(
-            (args_dict["server_host"], int(args_dict["server_port"])),
-            timeout=10,
-        )
-        print(
-            f"[+] TCP Connection verified with {args_dict['server_host']}:{args_dict['server_port']}",
-            flush=True,
-        )
-        _send_json_line(sock, {"type": "status", "event": "ready", "ts": time.time()})
-    except Exception as exc:
-        print(f"[-] Connection to FastAPI server failed: {exc}", flush=True)
-        exit_event.set()
-        return
+    if standalone:
+        # Chế độ chạy một mình: không cần GUI/web server, in kết quả ra stdout.
+        print("[*] Standalone: bỏ qua TCP socket, in kết quả ra stdout (dừng bằng Ctrl+C).",
+              flush=True)
+    else:
+        try:
+            sock = socket.create_connection(
+                (args_dict["server_host"], int(args_dict["server_port"])),
+                timeout=10,
+            )
+            print(
+                f"[+] TCP Connection verified with {args_dict['server_host']}:{args_dict['server_port']}",
+                flush=True,
+            )
+            _send_json_line(sock, {"type": "status", "event": "ready", "ts": time.time()})
+        except Exception as exc:
+            print(f"[-] Connection to FastAPI server failed: {exc}", flush=True)
+            exit_event.set()
+            return
 
     # ── ThingsBoard MQTT (chạy song song luồng TCP→FastAPI, lỗi không làm sập web) ──
     tb_client = None
@@ -534,30 +548,31 @@ def ai_worker_process(
 
     try:
         while not exit_event.is_set():
-            readable, _, _ = select.select([sock], [], [], 0)
-            if readable:
-                try:
-                    recv_buffer, messages = _recv_control_messages(sock, recv_buffer)
-                except Exception as exc:
-                    print(
-                        f"[!] Control socket closed or invalid: {exc}. Initiating teardown...",
-                        flush=True,
-                    )
-                    exit_event.set()
-                    break
-
-                for message in messages:
-                    if str(message.get("cmd", "")).lower() == "stop":
-                        print("[*] Stop command received from FastAPI controller.", flush=True)
-                        try:
-                            _send_json_line(
-                                sock,
-                                {"type": "status", "event": "stopping", "ts": time.time()},
-                            )
-                        except Exception:
-                            pass
+            if sock is not None:
+                readable, _, _ = select.select([sock], [], [], 0)
+                if readable:
+                    try:
+                        recv_buffer, messages = _recv_control_messages(sock, recv_buffer)
+                    except Exception as exc:
+                        print(
+                            f"[!] Control socket closed or invalid: {exc}. Initiating teardown...",
+                            flush=True,
+                        )
                         exit_event.set()
                         break
+
+                    for message in messages:
+                        if str(message.get("cmd", "")).lower() == "stop":
+                            print("[*] Stop command received from FastAPI controller.", flush=True)
+                            try:
+                                _send_json_line(
+                                    sock,
+                                    {"type": "status", "event": "stopping", "ts": time.time()},
+                                )
+                            except Exception:
+                                pass
+                            exit_event.set()
+                            break
 
             if exit_event.is_set():
                 break
@@ -626,15 +641,25 @@ def ai_worker_process(
                 "range_plot":      proc_result.get("range_plot"),
             }
 
-            try:
-                _send_json_line(sock, payload)
-            except Exception as exc:
+            if sock is None:
+                # Standalone: in tóm tắt kết quả ra stdout thay vì gửi server.
+                _r = ai_result
                 print(
-                    f"[!] Send failed (FastAPI disconnected): {exc}. Initiating teardown...",
+                    f"[result] seq={int(seq)} insect={proc_result['is_insect']} "
+                    f"label={_r.get('label')} score={_r.get('score')} "
+                    f"power={proc_result['power_threshold']:.0f}",
                     flush=True,
                 )
-                exit_event.set()
-                break
+            else:
+                try:
+                    _send_json_line(sock, payload)
+                except Exception as exc:
+                    print(
+                        f"[!] Send failed (FastAPI disconnected): {exc}. Initiating teardown...",
+                        flush=True,
+                    )
+                    exit_event.set()
+                    break
 
             # ── Đẩy kết quả lên ThingsBoard (telemetry ts = thời điểm thu lô raw) ──
             if tb_client is not None:
@@ -791,7 +816,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="High-throughput decoupled multi-process radar pipeline."
     )
     parser.add_argument("--server-host", type=str, default="127.0.0.1")
-    parser.add_argument("--server-port", type=int, required=True)
+    parser.add_argument("--server-port", type=int, default=0,
+                        help="TCP port of GUI/web to send results. Ignored with --standalone.")
+    parser.add_argument("--standalone", action="store_true",
+                        help="Run alone without GUI/web: print results to stdout. "
+                             "Still publishes ThingsBoard and opens plot window if --local-view.")
     parser.add_argument("--com-port", type=str, required=True)
     parser.add_argument("--cli-baud", type=int, default=921600)
     parser.add_argument("--cfg-path", type=str, required=True)
