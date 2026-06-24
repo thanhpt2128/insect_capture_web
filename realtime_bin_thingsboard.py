@@ -613,8 +613,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--model", type=str, default="svm", choices=["svm", "rf", "xgb"])
     parser.add_argument("--range-bin-min", type=int, default=15)
     parser.add_argument("--range-bin-max", type=int, default=20)
-    parser.add_argument("--preprocess-queue-size", type=int, default=10)
-    parser.add_argument("--ai-queue-size", type=int, default=10)
+    parser.add_argument("--preprocess-queue-size", type=int, default=2)
+    parser.add_argument("--ai-queue-size", type=int, default=2)
     # ── ThingsBoard (người dùng tự điền host/token) ──────────────────────
     parser.add_argument("--tb-host", type=str, default="",
                         help="Địa chỉ ThingsBoard MQTT broker (để trống = dry-run).")

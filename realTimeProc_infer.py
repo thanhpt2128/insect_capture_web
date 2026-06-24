@@ -426,17 +426,30 @@ def capture_worker_process(
                   f"com={args_dict['com_port']}; numframes={args_dict['numframes']}")
 
         seq = 0
+        prof = bool(args_dict.get("profile", True))
+        _last_loop = None
         while not exit_event.is_set():
+            _loop_t = time.perf_counter()
+            period_ms = (_loop_t - _last_loop) * 1000.0 if _last_loop is not None else 0.0
+            _last_loop = _loop_t
+
+            _t0 = time.perf_counter()
             raw_adc_data = dca.fastRead_in_Cpp_thread_get(
                 numframes=int(args_dict["numframes"]),
                 timeOut=2,
                 verbose=False,
                 sortInC=True,
             )
+            get_ms = (time.perf_counter() - _t0) * 1000.0
 
             size = int(getattr(raw_adc_data, "size", 0) or 0)
             if raw_adc_data is not None and size > 0:
+                _t1 = time.perf_counter()
                 preprocess_queue.put((seq, time.time(), raw_adc_data))
+                put_ms = (time.perf_counter() - _t1) * 1000.0
+                if prof:
+                    print(f"[T capture] seq={seq} get={get_ms:6.1f} put={put_ms:5.1f} "
+                          f"period={period_ms:6.1f}  (ms)", flush=True)
                 seq += 1
             else:
                 time.sleep(0.001)
@@ -521,8 +534,11 @@ def preprocessing_worker_process(
         iq_order="QQII",
     )
 
+    prof = bool(args_dict.get("profile", True))
+    _last_loop = None
     try:
         while not exit_event.is_set():
+            _wait_t = time.perf_counter()
             try:
                 seq, ts, raw_data = preprocess_queue.get(block=True, timeout=1.0)
             except Empty:
@@ -531,6 +547,10 @@ def preprocessing_worker_process(
                 if not exit_event.is_set():
                     print(f"[-] Preprocessing queue read failure: {exc}", flush=True)
                 continue
+            wait_ms = (time.perf_counter() - _wait_t) * 1000.0
+            _loop_t = time.perf_counter()
+            period_ms = (_loop_t - _last_loop) * 1000.0 if _last_loop is not None else 0.0
+            _last_loop = _loop_t
 
             try:
                 # Validate size before processing.
@@ -544,21 +564,34 @@ def preprocessing_worker_process(
                     continue
 
                 # F5: feed the raw int16 array straight into the DSP pipeline,
-                # no temp-file round-trip on disk.
+                # no temp-file round-trip on disk. Time ONLY the compute so we can
+                # tell pure DSP cost apart from queue-wait latency.
+                _dsp_t0 = time.time()
                 result = processor.process_array(raw_data)
+                dsp_ms = (time.time() - _dsp_t0) * 1000.0
 
                 # Build the compact range_plot for the UI from the processor's viz,
                 # then drop the heavy viz arrays (spectrogram etc.) before queueing.
+                _plot_t = time.perf_counter()
                 range_plot = _build_range_plot(result, processor.cfg.range_resolution)
+                plot_ms = (time.perf_counter() - _plot_t) * 1000.0
                 proc_result = {
                     "is_insect":       result["is_insect"],
                     "power_threshold": result["power_threshold"],
                     "features":        result["features"],   # None when background
                     "reason":          result.get("reason"), # None when insect
                     "range_plot":      range_plot,
+                    "dsp_ms":          round(dsp_ms, 1),
                 }
 
+                _put_t = time.perf_counter()
                 ai_queue.put((seq, ts, proc_result))
+                put_ms = (time.perf_counter() - _put_t) * 1000.0
+
+                if prof:
+                    print(f"[T preproc] seq={seq} wait={wait_ms:6.1f} dsp={dsp_ms:6.1f} "
+                          f"plot={plot_ms:5.1f} put={put_ms:5.1f} period={period_ms:6.1f}  (ms)",
+                          flush=True)
 
                 # Feed the local matplotlib viewer with the raw Range-Time Map
                 # (same data as the web), if the local view is enabled.
@@ -667,6 +700,8 @@ def ai_worker_process(
         print("[*] ThingsBoard tắt (TB_ENABLE=False hoặc chưa điền HOST/TOKEN).", flush=True)
         log_event("TB_DISABLED", "TB_ENABLE=False hoac chua dien HOST/TOKEN")
 
+    prof = bool(args_dict.get("profile", True))
+    _last_loop = None
     try:
         while not exit_event.is_set():
             if sock is not None:
@@ -699,6 +734,7 @@ def ai_worker_process(
             if exit_event.is_set():
                 break
 
+            _wait_t = time.perf_counter()
             try:
                 seq, ts, proc_result = ai_queue.get(block=True, timeout=1.0)
             except Empty:
@@ -707,8 +743,14 @@ def ai_worker_process(
                 if not exit_event.is_set():
                     print(f"[-] AI queue read failure: {exc}", flush=True)
                 continue
+            wait_ms = (time.perf_counter() - _wait_t) * 1000.0
+            _loop_t = time.perf_counter()
+            period_ms = (_loop_t - _last_loop) * 1000.0 if _last_loop is not None else 0.0
+            _last_loop = _loop_t
+            send_ms = mqtt_ms = sql_ms = 0.0
 
             # ── Inference ────────────────────────────────────────────────────
+            _inf_t0 = time.time()
             try:
                 if not proc_result["is_insect"]:
                     ai_result = {
@@ -749,12 +791,22 @@ def ai_worker_process(
                 traceback.print_exc()
                 ai_result = {"label": "error", "score": None, "proba": None}
 
+            # Pure model-inference time (proves the AI model itself is/ isn't slow).
+            infer_ms = (time.time() - _inf_t0) * 1000.0
+
+            # End-to-end latency: from when the 30-frame batch was gathered
+            # (capture stamped ts right before DSP) to inference done.
+            proc_ms = (time.time() - float(ts)) * 1000.0
+
             # ── Build and send payload ────────────────────────────────────────
             payload = {
                 "type":            "inference",
                 "mode":            "hardware",
                 "seq":             int(seq),
                 "ts":              float(ts),
+                "proc_ms":         round(proc_ms, 1),
+                "dsp_ms":          proc_result.get("dsp_ms"),
+                "infer_ms":        round(infer_ms, 2),
                 "com_port":        args_dict["com_port"],
                 "cfg_path":        args_dict["cfg_path"],
                 "is_insect":       proc_result["is_insect"],
@@ -773,6 +825,7 @@ def ai_worker_process(
                     flush=True,
                 )
             else:
+                _send_t = time.perf_counter()
                 try:
                     _send_json_line(sock, payload)
                 except Exception as exc:
@@ -782,9 +835,11 @@ def ai_worker_process(
                     )
                     exit_event.set()
                     break
+                send_ms = (time.perf_counter() - _send_t) * 1000.0
 
             # ── Đẩy kết quả lên ThingsBoard (telemetry ts = thời điểm thu lô raw) ──
             if tb_client is not None:
+                _mqtt_t = time.perf_counter()
                 try:
                     tb_values = {
                         "seq":             int(seq),
@@ -801,11 +856,13 @@ def ai_worker_process(
                     tb_client.publish(TB_TOPIC, json.dumps(tb_msg, ensure_ascii=False), qos=TB_QOS)
                 except Exception as exc:
                     print(f"[!] ThingsBoard publish failed at seq={seq}: {exc}", flush=True)
+                mqtt_ms = (time.perf_counter() - _mqtt_t) * 1000.0
 
             # ── Lưu vào SQLite KHI NHÃN PHÁT HIỆN THAY ĐỔI (bỏ qua nhãn 'error') ──
             if db_conn is not None:
                 cur_label = ai_result.get("label")
                 if cur_label and cur_label != "error" and cur_label != last_db_label:
+                    _sql_t = time.perf_counter()
                     insert_detection(
                         db_conn,
                         ts=float(ts),                               # đồng nhất với 'ts' gửi GUI
@@ -814,9 +871,17 @@ def ai_worker_process(
                         score=ai_result.get("score"),
                         proba=ai_result.get("proba"),
                     )
+                    sql_ms = (time.perf_counter() - _sql_t) * 1000.0
                     log_event("DETECTION_CHANGE",
                               f"label={cur_label}; score={ai_result.get('score')}")
                     last_db_label = cur_label
+
+            if prof:
+                loop_ms = (time.perf_counter() - _loop_t) * 1000.0
+                print(f"[T ai     ] seq={seq} wait={wait_ms:6.1f} infer={infer_ms:5.1f} "
+                      f"send={send_ms:5.1f} mqtt={mqtt_ms:5.1f} sql={sql_ms:5.1f} "
+                      f"loop={loop_ms:6.1f} period={period_ms:6.1f} proc_ms={proc_ms:7.1f}  (ms)",
+                      flush=True)
 
             if float(args_dict["interval"]) > 0:
                 time.sleep(float(args_dict["interval"]))
@@ -969,10 +1034,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cfg-path", type=str, required=True)
     parser.add_argument("--dca-cfg", type=str, default="cf.json")
     parser.add_argument("--numframes", type=int, default=30)
-    parser.add_argument("--frame-num-in-buf", type=int, default=128)
+    parser.add_argument("--frame-num-in-buf", type=int, default=256)
     # 0 = no artificial pacing; the client coalesces draws via requestAnimationFrame,
     # so a server-side sleep only adds latency and backlog.
     parser.add_argument("--interval", type=float, default=0.0)
+    # Size=1: any stage stall self-heals via overflow-drop (newest kept), so a
+    # transient freeze cannot inject a permanent 1-batch phase lag. Size>=2 lets a
+    # stall leave a stale batch that never drains (stages are exactly rate-matched
+    # to capture), pinning latency at depth x ~565ms. See profiling analysis.
     parser.add_argument("--preprocess-queue-size", type=int, default=10)
     parser.add_argument("--ai-queue-size", type=int, default=10)
     parser.add_argument("--model", type=str, default="svm",
@@ -986,6 +1055,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="open a local matplotlib range-time/range-profile window alongside the web stream")
     parser.add_argument("--view-history", type=int, default=300,
                         help="local waterfall width in frames (default: 300)")
+    parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=True,
+                        help="in thời gian xử lý từng tầng (capture/preproc/ai) mỗi lô để "
+                             "định vị tầng gây trễ. Tắt bằng --no-profile.")
 
     args = parser.parse_args(argv)
     args_dict = vars(args)

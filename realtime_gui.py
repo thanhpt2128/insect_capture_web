@@ -238,6 +238,8 @@ class App:
         self.status_var = StringVar(value="Idle")
         self.result_var = StringVar(value="—")
         self.label_var = StringVar(value="—")
+        self.latency_var = StringVar(value="— ms")
+        self.dsp_var = StringVar(value="— ms")
 
         self._build_ui()
         self._refresh_com()
@@ -286,6 +288,13 @@ class App:
         ttk.Label(res, text="Nhãn:").pack(side="left")
         ttk.Label(res, textvariable=self.label_var, font=("Segoe UI", 16, "bold"),
                   foreground="#c0392b").pack(side="left", padx=8)
+        # Ô thời gian: từ lúc gom đủ 30 frame (trước DSP) → lúc infer xong.
+        ttk.Label(res, text="Trễ xử lý:").pack(side="left", padx=(16, 0))
+        ttk.Label(res, textvariable=self.latency_var, font=("Segoe UI", 16, "bold"),
+                  foreground="#1565c0").pack(side="left", padx=8)
+        ttk.Label(res, text="DSP:").pack(side="left", padx=(16, 0))
+        ttk.Label(res, textvariable=self.dsp_var, font=("Segoe UI", 16, "bold"),
+                  foreground="#2e7d32").pack(side="left", padx=8)
         ttk.Label(res, textvariable=self.result_var, foreground="#444").pack(side="left", padx=8)
 
         # Biểu đồ matplotlib
@@ -425,14 +434,22 @@ class App:
         label = result.get("label", "—")
         score = result.get("score")
         self.label_var.set(str(label))
+        proc_ms = data.get("proc_ms")
+        if isinstance(proc_ms, (int, float)):
+            self.latency_var.set(f"{float(proc_ms):.0f} ms")
+        dsp_ms = data.get("dsp_ms")
+        if isinstance(dsp_ms, (int, float)):
+            self.dsp_var.set(f"{float(dsp_ms):.0f} ms")
         rp = data.get("range_plot") or {}
         proba = result.get("proba") or {}
         proba_str = ",".join(f"{k}:{float(v):.2f}" for k, v in proba.items()) if proba else "-"
+        infer_ms = data.get("infer_ms")
         parts = [
             f"seq={data.get('seq', '-')}",
             f"insect={data.get('is_insect')}",
             f"power={data.get('power_threshold', 0):.0f}" if isinstance(data.get("power_threshold"), (int, float)) else "power=-",
             f"score={score:.3f}" if isinstance(score, (int, float)) else "score=-",
+            f"infer={float(infer_ms):.1f}ms" if isinstance(infer_ms, (int, float)) else "infer=-",
             f"proba=[{proba_str}]",
             f"bins={rp.get('range_bins', '-')}",
             f"frames={rp.get('frame_count', '-')}",
