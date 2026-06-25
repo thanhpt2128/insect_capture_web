@@ -50,8 +50,18 @@ PACK(typedef struct {
     uint8_t byteCnt[6];
     uint8_t payload[packetSize_d-10];
 }) packet_t;
-UnlockQueue<packet_t> *udp_queue_g;
+// v2.0: the UDP receive thread now reassembles WHOLE FRAMES before queueing them,
+// so the queue stores raw frame bytes (not individual packets). The consumer
+// (udp_read_thread_get_frames) simply pops whole frames — no boundary search, no
+// per-call discard, and no lost "head-of-next-frame" bytes at packet boundaries.
+UnlockQueue<uint8_t> *udp_queue_g=NULL;
 std::thread udp_thread_g;
+// Frame-reassembly state, owned exclusively by the UDP receive thread.
+int       bytesInFrame_g=0;     // bytes per radar frame (set in udp_read_thread_init)
+uint8_t  *asmBuf_g=NULL;        // buffer assembling the current frame (size bytesInFrame_g)
+uint64_t  baseByte_g=0;         // absolute payload-byte offset mapped to asmBuf_g[0]
+bool      asmInited_g=false;    // false until the first frame boundary is locked
+uint32_t  framePutCnt_g=0;      // total whole frames pushed to the queue
 // py::array_t<uint8_t> doubleBuffer[2];
 // bool firstBufFull=false;
 
@@ -253,6 +263,20 @@ py::array_t<uint8_t> read_data_udp_async_wait(){
     return udp_val.get();
 }
 
+// Copy the slice of a received payload that overlaps one frame buffer.
+// [absByte, endByte) is the payload's absolute byte range; the frame buffer
+// covers [frameBase, frameBase+frameLen). Only the intersection is copied, so a
+// packet straddling a frame boundary fills the correct side, and bytes belonging
+// to lost packets are simply never written (they stay zero from the prior memset).
+static inline void copyFrameRegion(uint8_t *frameBuf, uint64_t frameBase,
+                                   const uint8_t *payload, uint64_t absByte,
+                                   uint64_t endByte, int frameLen){
+    uint64_t lo = std::max(absByte, frameBase);
+    uint64_t hi = std::min(endByte, frameBase + (uint64_t)frameLen);
+    if(lo < hi)
+        memcpy(frameBuf + (lo - frameBase), payload + (lo - absByte), (size_t)(hi - lo));
+}
+
 void _udp_read_thread(int sock_fd){
     udp_mutex.lock();
 
@@ -273,60 +297,76 @@ void _udp_read_thread(int sock_fd){
     socklen_t src_len = sizeof(src);
     memset(&src, 0, sizeof(src));
 
+    const int payloadSize = packetSize_d - 10;   // 1456 bytes of ADC payload per packet
     int n;
     packet_t buffer;
 
     while (udp_continue_g) {
-        // Try to receive data in non-blocking mode
+        // Non-blocking receive of one UDP packet from the DCA1000.
         n = recvfrom(sockfd, (char *)&buffer, packetSize_d,
                      0, (sockaddr*)&src, &src_len);
-        if (n > 0) { // Data received
-            // if(n!=packetSize_d){
-            //     printf("[fpga_udp]received packet length error: %d",n);
-            // }
-            udp_queue_g->Put(&buffer, 1);
-        }else{ // No data available
-            // std::this_thread::sleep_for(std::chrono::microseconds(10));
+        if (n <= 0)          // no data available right now
+            continue;
+
+        uint32_t seqNum  = buffer.seqNum;                         // 1-based packet index
+        uint64_t absByte = (uint64_t)(seqNum - 1) * payloadSize;  // payload start, absolute
+        uint64_t endByte = absByte + payloadSize;
+
+        receivedPacketNum_g++;
+        lastPacketNum_g = seqNum;
+
+        // Lock onto the first whole-frame boundary at/after the first packet seen,
+        // discarding at most one partial frame — once, ever. From here on frames
+        // are emitted aligned to bytesInFrame_g with no per-call resync.
+        if(!asmInited_g){
+            firstPacketNum_g = seqNum;
+            baseByte_g = ((absByte + bytesInFrame_g - 1) / bytesInFrame_g)
+                         * (uint64_t)bytesInFrame_g;
+            memset(asmBuf_g, 0, bytesInFrame_g);
+            asmInited_g = true;
         }
+        expectedPacketNum_g = lastPacketNum_g - firstPacketNum_g + 1;
+
+        if(endByte <= baseByte_g)   // stale/reordered packet for an already-emitted frame
+            continue;
+
+        // Emit every frame this packet completes. Normally runs 0 or 1 time; it runs
+        // more only when packet loss spans whole frames (those are emitted as zeros).
+        while(endByte >= baseByte_g + (uint64_t)bytesInFrame_g){
+            copyFrameRegion(asmBuf_g, baseByte_g, buffer.payload, absByte, endByte, bytesInFrame_g); // tail of current frame
+            udp_queue_g->Put(asmBuf_g, (uint32_t)bytesInFrame_g);                                    // push whole frame
+            framePutCnt_g++;
+            memset(asmBuf_g, 0, bytesInFrame_g);   // reset; bytes of lost packets stay zero
+            baseByte_g += (uint64_t)bytesInFrame_g;
+        }
+        // Remaining bytes of this packet start the (new) current frame.
+        copyFrameRegion(asmBuf_g, baseByte_g, buffer.payload, absByte, endByte, bytesInFrame_g);
     }
 
     udp_mutex.unlock();
 }
 
 py::array_t<uint8_t> udp_read_thread_get_frames(uint32_t frameNum, int bytesInFrame, int timeout_s, bool sort){
-    uint32_t maxPacketNum = ((frameNum+1)*bytesInFrame)/(packetSize_d-10)+1;
+    (void)sort;   // frames are already assembled & ordered by the receive thread
+    size_t totalBytes = (size_t)frameNum * (size_t)bytesInFrame;
     /* No pointer is passed, so NumPy will allocate the buffer */
-    auto result = py::array_t<uint8_t>(maxPacketNum*packetSize_d);
+    auto result = py::array_t<uint8_t>(totalBytes);
     py::buffer_info buf_info = result.request();
-    packet_t *buf_ptr = static_cast<packet_t *>(buf_info.ptr);
+    uint8_t *buf_ptr = static_cast<uint8_t *>(buf_info.ptr);
 
-    int lastFrameRemainBytes=0;
-    uint32_t ret;
-    uint64_t bytesCnt;
-    int receivePacketLen=0,lastFrameTransferedBytes;
+    // Pop frameNum whole frames from the queue, waiting up to timeout for them.
+    uint32_t got = udp_queue_g->Get_wait(buf_ptr, (uint32_t)totalBytes, timeout_s*1000);
+    if (got >= totalBytes)
+        return result;
 
-    // Wait for start of next frame
-    do{
-        ret = udp_queue_g->Get_wait(buf_ptr, 1, timeout_s*1000);
-        if (ret < 1){
-            printf("[fpga_udp]udp time out\n");
-            lastFrameRemainBytes=-1;
-            return result;
-        }
-        bytesCnt = (buf_ptr->seqNum-1)*(packetSize_d-10);
-        lastFrameTransferedBytes = bytesCnt % bytesInFrame;
-        lastFrameRemainBytes = (bytesInFrame-lastFrameTransferedBytes) % bytesInFrame;
-    }while(lastFrameRemainBytes>=packetSize_d-10);
-    
-    expectedPacketNum_g = ceil((lastFrameRemainBytes + frameNum*bytesInFrame)/((double)(packetSize_d-10)));
-
-    // Read in the rest of the frame
-    ret = udp_queue_g->Get_wait(buf_ptr+1, expectedPacketNum_g-1, timeout_s*1000);
-    if (ret < expectedPacketNum_g-1)
-        printf("[fpga_udp]udp time out\n");
-
-    if(sort) return postProc_packet_sort(result,frameNum,bytesInFrame,packetSize_d,lastFrameRemainBytes,receivedPacketNum_g,firstPacketNum_g,lastPacketNum_g);
-    return result;
+    // Timeout: return only the whole frames actually obtained (frame-aligned) so the
+    // caller skips this incomplete batch instead of processing zero-padded data.
+    printf("[fpga_udp]udp time out (got %u/%zu bytes)\n", got, totalBytes);
+    size_t alignedBytes = ((size_t)got / (size_t)bytesInFrame) * (size_t)bytesInFrame;
+    auto trimmed = py::array_t<uint8_t>(alignedBytes);
+    if (alignedBytes)
+        memcpy(trimmed.request().ptr, buf_ptr, alignedBytes);
+    return trimmed;
 }
 
 PYBIND11_MODULE(fpga_udp, m) {
@@ -421,8 +461,16 @@ PYBIND11_MODULE(fpga_udp, m) {
     m.def("get_lastPacketNum", []() {return lastPacketNum_g;});
     m.def("get_expectedPacketNum", []() {return expectedPacketNum_g;});
     m.def("udp_read_thread_init", [](int bytesInFrame, int frameNumInBuf) {
-        uint32_t maxPacketNum = ((frameNumInBuf+1)*bytesInFrame)/(packetSize_d-10)+1;
-        udp_queue_g = new UnlockQueue<packet_t>(maxPacketNum);
+        // v2.0: byte-oriented queue holding whole reassembled frames. Returns the
+        // queue capacity in BYTES (rounded up to a power of two by UnlockQueue).
+        bytesInFrame_g = bytesInFrame;
+        udp_queue_g = new UnlockQueue<uint8_t>((uint32_t)frameNumInBuf * (uint32_t)bytesInFrame);
+        asmBuf_g = new uint8_t[bytesInFrame];
+        memset(asmBuf_g, 0, bytesInFrame);
+        asmInited_g = false;
+        baseByte_g = 0;
+        framePutCnt_g = 0;
+        receivedPacketNum_g = expectedPacketNum_g = firstPacketNum_g = lastPacketNum_g = 0;
         return udp_queue_g->size();
     });
     m.def("udp_read_thread_start", [](int sock_fd) {
@@ -431,21 +479,24 @@ PYBIND11_MODULE(fpga_udp, m) {
     });
     m.def("udp_read_thread_get_frames", &udp_read_thread_get_frames);
     m.def("udp_read_thread_isStarted", [](){return udp_continue_g.load();});
+    m.def("get_framePutCnt", [](){return framePutCnt_g;});
     m.def("udp_read_thread_stop", []() {
         if(udp_continue_g){
             udp_continue_g = false;
             udp_thread_g.join();
-            delete udp_queue_g;
+            delete udp_queue_g;      udp_queue_g = NULL;
+            delete[] asmBuf_g;       asmBuf_g = NULL;
+            asmInited_g = false;
         }
     });
     m.def("kfifo_benchmark", [](uint32_t loopTime,uint32_t maxPacketNum) {
-        udp_queue_g = new UnlockQueue<packet_t>(maxPacketNum);
+        UnlockQueue<packet_t> *bench_q = new UnlockQueue<packet_t>(maxPacketNum);
         packet_t buffer;
         auto start = std::chrono::system_clock::now();
         uint32_t realCnt=0;
         for(uint32_t i=0;i<loopTime;i++){
             buffer.seqNum=i;
-            uint32_t ret=udp_queue_g->Put(&buffer, 1);
+            uint32_t ret=bench_q->Put(&buffer, 1);
             if(ret!=1){
                 printf("%d\n",ret);
                 break;
@@ -457,7 +508,7 @@ PYBIND11_MODULE(fpga_udp, m) {
         auto dur_s=double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
         std::cout<<realCnt<<" loops cost "<<dur_s<<"sec, "<< realCnt*sizeof(packet_t)/dur_s/1024/1024 <<"MB/s"<<std::endl;
 
-        delete udp_queue_g;
+        delete bench_q;
     });
 
     m.def("AWR2243_firmwareDownload",[](){

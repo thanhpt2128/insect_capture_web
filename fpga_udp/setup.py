@@ -4,7 +4,7 @@ from setuptools import setup
 import platform
 from glob import glob
 
-__version__ = "1.3.0"
+__version__ = "2.0.0"
 
 # The main interface is through Pybind11Extension.
 # * You can add cxx_std=11/14/17, and then build_ext can be removed.
@@ -59,7 +59,7 @@ ext_modules = [
 setup(
     name="fpga_udp",
     version=__version__,
-    author="Weifan Gao",
+    author="Weifan Gao, PTT",
     author_email="gaoweifangao@gmail.com",
     url="https://github.com/gaoweifan/pyRadar",
     description="FPGA UDP reader plugin using pybind11",

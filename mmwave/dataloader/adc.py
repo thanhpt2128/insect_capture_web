@@ -800,7 +800,9 @@ class DCA1000:
     def fastRead_in_Cpp_thread_start(self,frameNumInBuf=2):
         self.frameNumInBuf=frameNumInBuf
         ret = fpga_udp.udp_read_thread_init(BYTES_IN_FRAME,frameNumInBuf)
-        print("allocated udp buffer length:",ret,"size(MB):",ret*BYTES_OF_PACKET/1024/1024)
+        # v2.0: udp_read_thread_init now returns the queue capacity in BYTES
+        # (whole-frame queue), not a packet count.
+        print("allocated udp buffer length(bytes):",ret,"size(MB):",ret/1024/1024)
         fpga_udp.udp_read_thread_start(self.data_socket.fileno())
         print("udp thread started")
 
