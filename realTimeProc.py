@@ -83,7 +83,7 @@ try:
     radar = TI(cli_loc='COM5',cli_baud=921600, data_loc='COM3',data_baud=921600,config_file=radar_config_file,verbose=True)
     numLoops=30
     frameNumInBuf=512
-    numframes=15 # numframes必须<=frameNumInBuf
+    numframes=30 # numframes必须<=frameNumInBuf
     radar.setFrameCfg(0) # 0 for infinite frames
     
     # 3. 通过网口UDP发送配置FPGA指令
