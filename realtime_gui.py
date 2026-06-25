@@ -41,6 +41,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "realTimeProc_infer.py"
 CONFIG_DIR = HERE / "configFiles"
+IQ_HISTORY = 4096
 WATERFALL_HISTORY = 300   # số frame hiển thị bề ngang waterfall
 
 
@@ -114,7 +115,7 @@ class RealtimeController:
             "--server-host", str(host), "--server-port", str(port),
             "--com-port", com, "--cli-baud", str(baud),
             "--cfg-path", cfg, "--numframes", str(numframes),
-            "--model", model, "--no-local-view",
+            "--model", model, "--no-local-view", "--no-profile",
         ]
         self.log_q.put(">>> " + " ".join(cmd))
         self.proc = subprocess.Popen(
@@ -222,13 +223,17 @@ class App:
 
         self.ctrl = RealtimeController()
         self.latest_range_plot: dict | None = None
+        self.latest_iq_plot: dict | None = None
         self.range_dirty = False
+        self.iq_dirty = False
 
         # waterfall state
         self.n_bins: int | None = None
         self.wf_buf: np.ndarray | None = None
         self.wf_im = None
         self.range_res = 1.0
+        self.iq_i_buf = np.full(IQ_HISTORY, np.nan, dtype=np.float32)
+        self.iq_q_buf = np.full(IQ_HISTORY, np.nan, dtype=np.float32)
 
         self.com_var = StringVar()
         self.cfg_var = StringVar()
@@ -298,24 +303,53 @@ class App:
         ttk.Label(res, textvariable=self.result_var, foreground="#444").pack(side="left", padx=8)
 
         # Biểu đồ matplotlib
-        self.fig = Figure(figsize=(8, 5.2), dpi=100)
-        self.ax_wf = self.fig.add_subplot(2, 1, 1)
-        self.ax_pr = self.fig.add_subplot(2, 1, 2)
-        self.ax_wf.set_title("Range-Time (waterfall)")
+        grid = ttk.Frame(self.root, padding=8)
+        grid.pack(side="top", fill="both", expand=True)
+        grid.columnconfigure(0, weight=1, uniform="plot")
+        grid.columnconfigure(1, weight=1, uniform="plot")
+        grid.rowconfigure(0, weight=1, uniform="plot")
+        grid.rowconfigure(1, weight=1, uniform="plot")
+
+        wf_box = ttk.LabelFrame(grid, text="Range-Time")
+        wf_box.grid(row=0, column=0, sticky=N + S + EW, padx=(0, 4), pady=(0, 4))
+        self.fig_wf = Figure(figsize=(5, 3), dpi=100)
+        self.ax_wf = self.fig_wf.add_subplot(1, 1, 1)
         self.ax_wf.set_xlabel("Time (frames)")
         self.ax_wf.set_ylabel("Range (m)")
-        self.ax_pr.set_title("Range Profile")
+        self.fig_wf.tight_layout()
+        self.canvas_wf = FigureCanvasTkAgg(self.fig_wf, master=wf_box)
+        self.canvas_wf.get_tk_widget().pack(fill="both", expand=True)
+
+        pr_box = ttk.LabelFrame(grid, text="Range Profile")
+        pr_box.grid(row=0, column=1, sticky=N + S + EW, padx=(4, 0), pady=(0, 4))
+        self.fig_pr = Figure(figsize=(5, 3), dpi=100)
+        self.ax_pr = self.fig_pr.add_subplot(1, 1, 1)
         self.ax_pr.set_xlabel("Range bin")
         self.ax_pr.set_ylabel("Amplitude (dB)")
         (self.pr_line,) = self.ax_pr.plot([], [], color="#1f77b4", lw=1.6)
-        self.fig.tight_layout()
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True, padx=8, pady=4)
+        self.fig_pr.tight_layout()
+        self.canvas_pr = FigureCanvasTkAgg(self.fig_pr, master=pr_box)
+        self.canvas_pr.get_tk_widget().pack(fill="both", expand=True)
 
-        # Log
-        ttk.Label(self.root, text="Log worker", padding=(8, 0)).pack(side="top", anchor=W)
-        self.log = scrolledtext.ScrolledText(self.root, height=7, state=DISABLED, wrap="word")
-        self.log.pack(side="top", fill="x", padx=8, pady=(0, 8))
+        iq_box = ttk.LabelFrame(grid, text="I/Q Amplitude")
+        iq_box.grid(row=1, column=0, sticky=N + S + EW, padx=(0, 4), pady=(4, 0))
+        self.fig_iq = Figure(figsize=(5, 3), dpi=100)
+        self.ax_iq = self.fig_iq.add_subplot(1, 1, 1)
+        self.ax_iq.set_xlabel("Recent samples")
+        self.ax_iq.set_ylabel("ADC")
+        x_iq = np.arange(IQ_HISTORY)
+        (self.i_line,) = self.ax_iq.plot(x_iq, self.iq_i_buf, color="#d62728", lw=1.0, label="I")
+        (self.q_line,) = self.ax_iq.plot(x_iq, self.iq_q_buf, color="#1f77b4", lw=1.0, label="Q")
+        self.ax_iq.set_xlim(0, IQ_HISTORY - 1)
+        self.ax_iq.legend(loc="upper right")
+        self.fig_iq.tight_layout()
+        self.canvas_iq = FigureCanvasTkAgg(self.fig_iq, master=iq_box)
+        self.canvas_iq.get_tk_widget().pack(fill="both", expand=True)
+
+        log_box = ttk.LabelFrame(grid, text="Worker Log")
+        log_box.grid(row=1, column=1, sticky=N + S + EW, padx=(4, 0), pady=(4, 0))
+        self.log = scrolledtext.ScrolledText(log_box, height=7, state=DISABLED, wrap="word")
+        self.log.pack(fill="both", expand=True)
 
     # ------------------------------------------------------------- actions
     def _refresh_com(self):
@@ -414,6 +448,10 @@ class App:
         except queue.Empty:
             pass
 
+        if self.iq_dirty and self.latest_iq_plot is not None:
+            self._update_iq_plot(self.latest_iq_plot)
+            self.iq_dirty = False
+
         if self.range_dirty and self.latest_range_plot is not None:
             self._update_plots(self.latest_range_plot)
             self.range_dirty = False
@@ -430,6 +468,12 @@ class App:
             self._append_log(f"[status] {data.get('event')}")
             return
         # nhãn + dòng tóm tắt
+        if data.get("type") == "iq_preview":
+            iq_plot = data.get("iq_plot") or {}
+            if isinstance(iq_plot, dict) and iq_plot.get("ready"):
+                self.latest_iq_plot = iq_plot
+                self.iq_dirty = True
+            return
         result = data.get("result") or {}
         label = result.get("label", "—")
         score = result.get("score")
@@ -463,19 +507,69 @@ class App:
     # ------------------------------------------------------------- plots
     def _reset_plots(self):
         self.latest_range_plot = None
+        self.latest_iq_plot = None
         self.range_dirty = False
+        self.iq_dirty = False
         self.n_bins = None
         self.wf_buf = None
         self.wf_im = None
+        self.iq_i_buf[:] = np.nan
+        self.iq_q_buf[:] = np.nan
+        self.ax_iq.clear()
+        self.ax_iq.set_xlabel("Recent samples")
+        self.ax_iq.set_ylabel("ADC")
+        x_iq = np.arange(IQ_HISTORY)
+        (self.i_line,) = self.ax_iq.plot(x_iq, self.iq_i_buf, color="#d62728", lw=1.0, label="I")
+        (self.q_line,) = self.ax_iq.plot(x_iq, self.iq_q_buf, color="#1f77b4", lw=1.0, label="Q")
+        self.ax_iq.set_xlim(0, IQ_HISTORY - 1)
+        self.ax_iq.legend(loc="upper right")
         self.ax_wf.clear()
-        self.ax_wf.set_title("Range-Time (waterfall)")
         self.ax_wf.set_xlabel("Time (frames)")
         self.ax_wf.set_ylabel("Range (m)")
-        self.pr_line.set_data([], [])
+        self.ax_pr.clear()
+        self.ax_pr.set_xlabel("Range bin")
+        self.ax_pr.set_ylabel("Amplitude (dB)")
+        (self.pr_line,) = self.ax_pr.plot([], [], color="#1f77b4", lw=1.6)
         self.label_var.set("—")
         self.result_var.set("—")
         try:
-            self.canvas.draw_idle()
+            self.canvas_iq.draw_idle()
+            self.canvas_wf.draw_idle()
+            self.canvas_pr.draw_idle()
+        except Exception:
+            pass
+
+    def _update_iq_plot(self, iq: dict):
+        i_vals = np.asarray(iq.get("i") or [], dtype=np.float32)
+        q_vals = np.asarray(iq.get("q") or [], dtype=np.float32)
+        n = min(i_vals.size, q_vals.size, IQ_HISTORY)
+        if n <= 0:
+            return
+
+        i_vals = i_vals[-n:]
+        q_vals = q_vals[-n:]
+        self.iq_i_buf = np.roll(self.iq_i_buf, -n)
+        self.iq_q_buf = np.roll(self.iq_q_buf, -n)
+        self.iq_i_buf[-n:] = i_vals
+        self.iq_q_buf[-n:] = q_vals
+
+        self.i_line.set_ydata(self.iq_i_buf)
+        self.q_line.set_ydata(self.iq_q_buf)
+
+        combined = np.concatenate([
+            self.iq_i_buf[np.isfinite(self.iq_i_buf)],
+            self.iq_q_buf[np.isfinite(self.iq_q_buf)],
+        ])
+        if combined.size >= 16:
+            ymin = float(np.percentile(combined, 1))
+            ymax = float(np.percentile(combined, 99))
+            if ymin == ymax:
+                ymin, ymax = ymin - 1.0, ymax + 1.0
+            pad = max((ymax - ymin) * 0.08, 1.0)
+            self.ax_iq.set_ylim(ymin - pad, ymax + pad)
+
+        try:
+            self.canvas_iq.draw_idle()
         except Exception:
             pass
 
@@ -493,7 +587,6 @@ class App:
             self.n_bins = n_bins
             self.wf_buf = np.full((n_bins, WATERFALL_HISTORY), np.nan, dtype=np.float32)
             self.ax_wf.clear()
-            self.ax_wf.set_title("Range-Time (waterfall)")
             self.ax_wf.set_xlabel("Time (frames)")
             self.ax_wf.set_ylabel("Range (m)")
             max_range = n_bins * self.range_res
@@ -524,12 +617,15 @@ class App:
         self.ax_pr.set_ylim(pmin - 1, pmax + 1)
 
         try:
-            self.canvas.draw_idle()
+            self.canvas_wf.draw_idle()
+            self.canvas_pr.draw_idle()
         except Exception:
             pass
 
     # -------------------------------------------------------------- misc
     def _append_log(self, text: str):
+        if text.startswith("[T "):
+            return
         self.log.config(state=NORMAL)
         self.log.insert(END, text + "\n")
         # giới hạn ~500 dòng

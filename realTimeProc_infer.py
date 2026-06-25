@@ -30,6 +30,7 @@ TI = None
 # Number of int16 values per radar frame (must match RadarConfig in insect_radar_processor.py)
 # 1 TX × 4 RX × 128 ADC samples × 128 loops × 2 (I+Q) = 131 072
 _INT16_PER_FRAME = 131_072
+_COMPLEX_PER_FRAME = _INT16_PER_FRAME // 2
 
 # ─────────────────────────────────────────────────────────────────────────
 # ThingsBoard (hard-code — file dùng riêng cá nhân). Điền HOST và TOKEN vào đây.
@@ -332,6 +333,49 @@ def _build_range_plot(result: Dict[str, Any], range_resolution_m: float) -> Opti
     }
 
 
+def _build_iq_plot(
+    seq: int,
+    ts: float,
+    complex_frame: Any,
+    preview_samples: int,
+) -> Optional[Dict[str, Any]]:
+    """Build a compact one-frame IQ preview for the GUI sliding waveform."""
+    samples = np.asarray(complex_frame, dtype=np.complex64).ravel()
+    if samples.size == 0:
+        return None
+
+    n_preview = max(1, min(int(preview_samples), int(samples.size)))
+    if n_preview < samples.size:
+        idx = np.linspace(0, samples.size - 1, num=n_preview, dtype=np.int64)
+        view = samples[idx]
+    else:
+        view = samples
+
+    i_vals = np.real(view).astype(np.float32, copy=False)
+    q_vals = np.imag(view).astype(np.float32, copy=False)
+
+    def _round(values: Any) -> List[float]:
+        return [round(float(v), 3) for v in np.asarray(values).ravel().tolist()]
+
+    return {
+        "type": "iq_preview",
+        "seq": int(seq),
+        "ts": float(ts),
+        "iq_plot": {
+            "ready": True,
+            "frame_seq": int(seq),
+            "sample_count": int(samples.size),
+            "preview_count": int(n_preview),
+            "i": _round(i_vals),
+            "q": _round(q_vals),
+            "i_min": round(float(np.min(i_vals)), 3),
+            "i_max": round(float(np.max(i_vals)), 3),
+            "q_min": round(float(np.min(q_vals)), 3),
+            "q_max": round(float(np.max(q_vals)), 3),
+        },
+    }
+
+
 class DropOldestQueue:
     """Bounded multiprocessing queue that drops stale items instead of blocking."""
 
@@ -372,9 +416,12 @@ def capture_worker_process(
     exit_event: multiprocessing.Event,
     preprocess_queue: DropOldestQueue,
     args_dict: Dict[str, Any],
+    iq_preview_queue: Optional[DropOldestQueue] = None,
 ) -> None:
     """Process 1: configure radar/DCA1000 and capture raw ADC frames."""
     import_dependencies()
+    from insect_radar_processor.insect_radar_processor import _int16_to_complex
+
     print("[+] Capture Process initiated.", flush=True)
 
     dca = None
@@ -418,15 +465,19 @@ def capture_worker_process(
         )
 
         dca.stream_start()
-        max_buffer_size = max(int(args_dict["frame_num_in_buf"]), int(args_dict["numframes"]))
+        batch_frames = max(1, int(args_dict["numframes"]))
+        max_buffer_size = max(int(args_dict["frame_num_in_buf"]), batch_frames)
         dca.fastRead_in_Cpp_thread_start(max_buffer_size)
         radar.startSensor()
         print("[+] Hardware started. Capturing UDP data...", flush=True)
         log_event("CAPTURE_START",
-                  f"com={args_dict['com_port']}; numframes={args_dict['numframes']}")
+                  f"com={args_dict['com_port']}; get_numframes=1; batch_frames={batch_frames}")
 
-        seq = 0
+        frame_seq = 0
+        batch_seq = 0
+        iq_batch: List[Any] = []
         prof = bool(args_dict.get("profile", True))
+        preview_samples = max(1, int(args_dict.get("iq_preview_samples", 256)))
         _last_loop = None
         while not exit_event.is_set():
             _loop_t = time.perf_counter()
@@ -435,7 +486,7 @@ def capture_worker_process(
 
             _t0 = time.perf_counter()
             raw_adc_data = dca.fastRead_in_Cpp_thread_get(
-                numframes=int(args_dict["numframes"]),
+                numframes=1,
                 timeOut=2,
                 verbose=False,
                 sortInC=True,
@@ -444,13 +495,54 @@ def capture_worker_process(
 
             size = int(getattr(raw_adc_data, "size", 0) or 0)
             if raw_adc_data is not None and size > 0:
-                _t1 = time.perf_counter()
-                preprocess_queue.put((seq, time.time(), raw_adc_data))
-                put_ms = (time.perf_counter() - _t1) * 1000.0
+                if size != _INT16_PER_FRAME:
+                    print(
+                        f"[!] frame_seq={frame_seq}: expected {_INT16_PER_FRAME} int16 values, "
+                        f"got {size}. Skipping.",
+                        flush=True,
+                    )
+                    frame_seq += 1
+                    continue
+
+                _decode_t = time.perf_counter()
+                complex_frame = _int16_to_complex(raw_adc_data, iq_order="QQII")
+                decode_ms = (time.perf_counter() - _decode_t) * 1000.0
+
+                if iq_preview_queue is not None:
+                    try:
+                        preview = _build_iq_plot(
+                            frame_seq,
+                            time.time(),
+                            complex_frame,
+                            preview_samples=preview_samples,
+                        )
+                        if preview is not None:
+                            iq_preview_queue.put(preview)
+                    except Exception:
+                        pass
+
+                iq_batch.append(complex_frame)
+                put_ms = 0.0
+                queued_batch = False
+                if len(iq_batch) >= batch_frames:
+                    _t1 = time.perf_counter()
+                    batch_iq = np.concatenate(iq_batch[:batch_frames]).astype(
+                        np.complex64,
+                        copy=False,
+                    )
+                    del iq_batch[:batch_frames]
+                    preprocess_queue.put((batch_seq, time.time(), batch_iq, "complex"))
+                    put_ms = (time.perf_counter() - _t1) * 1000.0
+                    queued_batch = True
+                    batch_seq += 1
+
                 if prof:
-                    print(f"[T capture] seq={seq} get={get_ms:6.1f} put={put_ms:5.1f} "
-                          f"period={period_ms:6.1f}  (ms)", flush=True)
-                seq += 1
+                    print(f"[T capture] frame={frame_seq} get={get_ms:6.1f} "
+                          f"decode={decode_ms:5.1f} put={put_ms:5.1f} "
+                          f"batch={len(iq_batch):02d}/{batch_frames} "
+                          f"queued={int(queued_batch)} period={period_ms:6.1f}  (ms)",
+                          flush=True)
+                frame_seq += 1
             else:
                 time.sleep(0.001)
 
@@ -498,12 +590,12 @@ def preprocessing_worker_process(
 ) -> None:
     """Process 2: DSP pipeline — Range-FFT, STFT, feature extraction via InsectRadarProcessor."""
     import_dependencies()
-    from insect_radar_processor.insect_radar_processor import InsectRadarProcessor
+    from insect_radar_processor.insect_radar_processor import InsectRadarProcessor, _int16_to_complex
 
     print("[+] Preprocessing Process initiated.", flush=True)
 
     n_frames = int(args_dict["numframes"])
-    expected_int16 = n_frames * _INT16_PER_FRAME
+    expected_complex = n_frames * _COMPLEX_PER_FRAME
     if n_frames != 30:
         print(
             f"[!] WARNING: numframes={n_frames}. InsectRadarProcessor expects 30 frames. "
@@ -540,7 +632,12 @@ def preprocessing_worker_process(
         while not exit_event.is_set():
             _wait_t = time.perf_counter()
             try:
-                seq, ts, raw_data = preprocess_queue.get(block=True, timeout=1.0)
+                item = preprocess_queue.get(block=True, timeout=1.0)
+                if isinstance(item, tuple) and len(item) >= 4 and item[3] == "complex":
+                    seq, ts, iq_data, _kind = item[:4]
+                else:
+                    seq, ts, raw_data = item[:3]
+                    iq_data = _int16_to_complex(raw_data, iq_order="QQII")
             except Empty:
                 continue
             except Exception as exc:
@@ -554,20 +651,19 @@ def preprocessing_worker_process(
 
             try:
                 # Validate size before processing.
-                actual = int(getattr(raw_data, "size", 0) or 0)
-                if actual != expected_int16:
+                actual = int(getattr(iq_data, "size", 0) or 0)
+                if actual != expected_complex:
                     print(
-                        f"[!] seq={seq}: expected {expected_int16} int16 values, "
+                        f"[!] seq={seq}: expected {expected_complex} complex IQ samples, "
                         f"got {actual}. Skipping.",
                         flush=True,
                     )
                     continue
 
-                # F5: feed the raw int16 array straight into the DSP pipeline,
-                # no temp-file round-trip on disk. Time ONLY the compute so we can
-                # tell pure DSP cost apart from queue-wait latency.
+                # The capture process already decoded raw int16 -> complex IQ one
+                # frame at a time, so DSP starts at cube reshape here.
                 _dsp_t0 = time.time()
-                result = processor.process_array(raw_data)
+                result = processor.process_complex(iq_data)
                 dsp_ms = (time.time() - _dsp_t0) * 1000.0
 
                 # Build the compact range_plot for the UI from the processor's viz,
@@ -615,6 +711,7 @@ def ai_worker_process(
     exit_event: multiprocessing.Event,
     ai_queue: DropOldestQueue,
     args_dict: Dict[str, Any],
+    iq_preview_queue: Optional[DropOldestQueue] = None,
 ) -> None:
     """Process 3: run model inference on extracted features and stream JSON Lines to FastAPI."""
     import_dependencies()
@@ -702,6 +799,34 @@ def ai_worker_process(
 
     prof = bool(args_dict.get("profile", True))
     _last_loop = None
+
+    def _drain_iq_preview() -> bool:
+        if sock is None or iq_preview_queue is None:
+            return True
+
+        latest = None
+        while True:
+            try:
+                latest = iq_preview_queue.get(block=False)
+            except Empty:
+                break
+            except Exception:
+                break
+
+        if latest is None:
+            return True
+
+        try:
+            _send_json_line(sock, latest)
+            return True
+        except Exception as exc:
+            print(
+                f"[!] IQ preview send failed (GUI disconnected): {exc}. Initiating teardown...",
+                flush=True,
+            )
+            exit_event.set()
+            return False
+
     try:
         while not exit_event.is_set():
             if sock is not None:
@@ -734,10 +859,14 @@ def ai_worker_process(
             if exit_event.is_set():
                 break
 
+            if not _drain_iq_preview():
+                break
+
             _wait_t = time.perf_counter()
             try:
-                seq, ts, proc_result = ai_queue.get(block=True, timeout=1.0)
+                seq, ts, proc_result = ai_queue.get(block=True, timeout=0.05)
             except Empty:
+                _drain_iq_preview()
                 continue
             except Exception as exc:
                 if not exit_event.is_set():
@@ -1055,6 +1184,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="open a local matplotlib range-time/range-profile window alongside the web stream")
     parser.add_argument("--view-history", type=int, default=300,
                         help="local waterfall width in frames (default: 300)")
+    parser.add_argument("--iq-preview-samples", type=int, default=256,
+                        help="number of downsampled IQ samples sent to GUI for each captured frame")
+    parser.add_argument("--iq-preview-queue-size", type=int, default=4,
+                        help="drop-oldest queue depth for live IQ GUI previews")
     parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=True,
                         help="in thời gian xử lý từng tầng (capture/preproc/ai) mỗi lô để "
                              "định vị tầng gây trễ. Tắt bằng --no-profile.")
@@ -1070,6 +1203,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     exit_event = multiprocessing.Event()
     preprocess_queue = DropOldestQueue(maxsize=max(1, int(args.preprocess_queue_size)))
     ai_queue = DropOldestQueue(maxsize=max(1, int(args.ai_queue_size)))
+    iq_preview_queue = DropOldestQueue(maxsize=max(1, int(args.iq_preview_queue_size)))
     plot_queue = DropOldestQueue(maxsize=2) if args.local_view else None
 
     def signal_handler(signum: int, _frame: Any) -> None:
@@ -1086,7 +1220,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     capture_proc = multiprocessing.Process(
         target=capture_worker_process,
-        args=(exit_event, preprocess_queue, args_dict),
+        args=(exit_event, preprocess_queue, args_dict, iq_preview_queue),
         name="RadarCaptureProcess",
     )
     preprocess_proc = multiprocessing.Process(
@@ -1096,7 +1230,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     ai_proc = multiprocessing.Process(
         target=ai_worker_process,
-        args=(exit_event, ai_queue, args_dict),
+        args=(exit_event, ai_queue, args_dict, iq_preview_queue),
         name="InferenceProcess",
     )
     processes = [capture_proc, preprocess_proc, ai_proc]
@@ -1144,6 +1278,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     preprocess_queue.close()
     ai_queue.close()
+    iq_preview_queue.close()
     if plot_queue is not None:
         plot_queue.close()
 

@@ -308,9 +308,10 @@ def _track_peaks(range_fft: np.ndarray,
     smooth_peaks = np.round(smooth_peaks).astype(int)
 
     # Chuẩn bị dữ liệu cho Range-Time Map
+    magnitude_map = magnitude_map/50
     rtm_db   = 20 * np.log10(magnitude_map + 1e-6)
-    rtm_vmin = float(np.percentile(rtm_db, 5))
-    rtm_vmax = float(np.percentile(rtm_db, 99))
+    rtm_vmin = 1
+    rtm_vmax = 5
 
     return smooth_peaks, rtm_db, rtm_vmin, rtm_vmax
 
@@ -862,10 +863,19 @@ class InsectRadarProcessor:
         -------
         result : dict — giống hệt process()
         """
-        cfg = self.cfg
-
         # ── BƯỚC 1: int16 thô → complex signal ───────────────────────────────
         complex_data = _int16_to_complex(raw_int16, iq_order=self.iq_order)
+        return self.process_complex(complex_data)
+
+    def process_complex(self, complex_data: np.ndarray) -> dict:
+        """
+        Run the DSP pipeline for IQ data that has already been decoded to complex64.
+
+        Realtime capture uses this after reading one raw frame at a time, decoding
+        it immediately for IQ preview, and batching enough complex frames for DSP.
+        """
+        cfg = self.cfg
+        complex_data = np.asarray(complex_data, dtype=np.complex64).ravel()
 
         # Tính số frame thực tế (phòng trường hợp dữ liệu hơi thừa/thiếu mẫu)
         n_samples_per_frame = (cfg.num_tx * cfg.num_rx *
