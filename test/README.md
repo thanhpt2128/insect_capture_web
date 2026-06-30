@@ -27,6 +27,7 @@ dữ liệu raw thật trong `data_parse/` và model thật trong
 | `test_pipeline_functional.py` | correctness | Alignment 58 feature, schema `process_complex`, tương đương IQ order QQII↔IIQQ, hình học cfg=131072, smoke inference svm. |
 | `bench_dsp_inference.py` | benchmark | Thời gian từng tầng P1/P2/P3 + soak 150 lô (rò rỉ RAM, trôi độ trễ) + kết luận ngân sách thời gian thực. |
 | `bench_queue.py` | benchmark | Thông lượng put (payload nhỏ & 16MB) + độ trễ cross-process (chế độ thật & bão hòa). |
+| `bench_iq_fps.py` | benchmark | FPS thực tế panel I/Q (TkAgg): so cũ (full draw 4096) vs mới (blitting + downsample 1024). |
 | `GUI_CODE_QUALITY.md` | đánh giá | Phân tích chất lượng luồng code GUI: điểm tốt + điểm cần cải thiện. |
 | `run_all.py` | runner | Chạy lần lượt các file *correctness*, tổng hợp PASS/FAIL. |
 
@@ -37,6 +38,8 @@ dữ liệu raw thật trong `data_parse/` và model thật trong
 - Soak 150 lô: **không rò rỉ RAM, không trôi độ trễ**.
 - DropOldestQueue (sau fix): **giữ phần tử mới nhất 100%** mọi kịch bản, kể cả
   payload 16MB cross-process (trước fix: 0%).
+- Panel I/Q (TkAgg, sau blitting + downsample 1024): **~82 FPS** (12,2 ms/lần),
+  so với **~12 FPS** (84,8 ms/lần) khi full-draw 4096 điểm trước đây.
 
 ## Phụ thuộc
 

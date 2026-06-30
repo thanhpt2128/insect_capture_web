@@ -41,7 +41,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "realTimeProc_infer.py"
 CONFIG_DIR = HERE / "configFiles"
-IQ_HISTORY = 4096
+# Số mẫu I/Q hiển thị trên trục x của panel I/Q. Giảm 4096->1024 (≈4 frame x 256
+# mẫu) để cắt mạnh chi phí rasterize line; kết hợp blitting (xem _update_iq_plot)
+# đưa thời gian vẽ ~65ms -> ~10ms, đủ vẽ >60 FPS.
+IQ_HISTORY = 1024
 WATERFALL_HISTORY = 300   # số frame hiển thị bề ngang waterfall
 
 
@@ -234,6 +237,10 @@ class App:
         self.range_res = 1.0
         self.iq_i_buf = np.full(IQ_HISTORY, np.nan, dtype=np.float32)
         self.iq_q_buf = np.full(IQ_HISTORY, np.nan, dtype=np.float32)
+        # Blitting cho panel I/Q: cache nền (trục/tick/legend) và chỉ vẽ lại 2
+        # đường line mỗi frame. Đặt lại khi đổi khung y hoặc khi canvas resize.
+        self.iq_bg = None
+        self.iq_ylim = None
 
         self.com_var = StringVar()
         self.cfg_var = StringVar()
@@ -338,13 +345,18 @@ class App:
         self.ax_iq.set_xlabel("Recent samples")
         self.ax_iq.set_ylabel("ADC")
         x_iq = np.arange(IQ_HISTORY)
-        (self.i_line,) = self.ax_iq.plot(x_iq, self.iq_i_buf, color="#d62728", lw=1.0, label="I")
-        (self.q_line,) = self.ax_iq.plot(x_iq, self.iq_q_buf, color="#1f77b4", lw=1.0, label="Q")
+        (self.i_line,) = self.ax_iq.plot(x_iq, self.iq_i_buf, color="#d62728", lw=1.0,
+                                         label="I", animated=True)
+        (self.q_line,) = self.ax_iq.plot(x_iq, self.iq_q_buf, color="#1f77b4", lw=1.0,
+                                         label="Q", animated=True)
         self.ax_iq.set_xlim(0, IQ_HISTORY - 1)
         self.ax_iq.legend(loc="upper right")
         self.fig_iq.tight_layout()
         self.canvas_iq = FigureCanvasTkAgg(self.fig_iq, master=iq_box)
         self.canvas_iq.get_tk_widget().pack(fill="both", expand=True)
+        # Canvas đổi kích thước -> nền cache hết hiệu lực, buộc chụp lại nền.
+        self.canvas_iq.get_tk_widget().bind(
+            "<Configure>", lambda _e: setattr(self, "iq_bg", None))
 
         log_box = ttk.LabelFrame(grid, text="Worker Log")
         log_box.grid(row=1, column=1, sticky=N + S + EW, padx=(4, 0), pady=(4, 0))
@@ -515,12 +527,16 @@ class App:
         self.wf_im = None
         self.iq_i_buf[:] = np.nan
         self.iq_q_buf[:] = np.nan
+        self.iq_bg = None
+        self.iq_ylim = None
         self.ax_iq.clear()
         self.ax_iq.set_xlabel("Recent samples")
         self.ax_iq.set_ylabel("ADC")
         x_iq = np.arange(IQ_HISTORY)
-        (self.i_line,) = self.ax_iq.plot(x_iq, self.iq_i_buf, color="#d62728", lw=1.0, label="I")
-        (self.q_line,) = self.ax_iq.plot(x_iq, self.iq_q_buf, color="#1f77b4", lw=1.0, label="Q")
+        (self.i_line,) = self.ax_iq.plot(x_iq, self.iq_i_buf, color="#d62728", lw=1.0,
+                                         label="I", animated=True)
+        (self.q_line,) = self.ax_iq.plot(x_iq, self.iq_q_buf, color="#1f77b4", lw=1.0,
+                                         label="Q", animated=True)
         self.ax_iq.set_xlim(0, IQ_HISTORY - 1)
         self.ax_iq.legend(loc="upper right")
         self.ax_wf.clear()
@@ -556,22 +572,47 @@ class App:
         self.i_line.set_ydata(self.iq_i_buf)
         self.q_line.set_ydata(self.iq_q_buf)
 
+        # Khung y thích nghi CÓ HYSTERESIS: chỉ đổi (và vẽ lại nền) khi dữ liệu
+        # vượt khung hiện tại hoặc khung rộng gấp >3 lần biên độ dữ liệu. Nhờ vậy
+        # đa số frame đi đường blit nhanh, hiếm khi phải full-redraw.
+        need_full = self.iq_bg is None
         combined = np.concatenate([
             self.iq_i_buf[np.isfinite(self.iq_i_buf)],
             self.iq_q_buf[np.isfinite(self.iq_q_buf)],
         ])
         if combined.size >= 16:
-            ymin = float(np.percentile(combined, 1))
-            ymax = float(np.percentile(combined, 99))
-            if ymin == ymax:
-                ymin, ymax = ymin - 1.0, ymax + 1.0
-            pad = max((ymax - ymin) * 0.08, 1.0)
-            self.ax_iq.set_ylim(ymin - pad, ymax + pad)
+            data_lo = float(np.percentile(combined, 1))
+            data_hi = float(np.percentile(combined, 99))
+            if data_lo == data_hi:
+                data_lo, data_hi = data_lo - 1.0, data_hi + 1.0
+            span = data_hi - data_lo
+            cur = self.iq_ylim
+            # Rescale chỉ khi dữ liệu TRÀN khung hiện tại, hoặc khung rộng quá mức
+            # (>3x biên độ). Khi rescale, chừa headroom 15% để nhiễu percentile nhỏ
+            # frame sau không lập tức tràn lại -> giữ blit là đường nhanh chủ đạo.
+            if (cur is None or data_lo < cur[0] or data_hi > cur[1]
+                    or (cur[1] - cur[0]) > 3.0 * max(span, 1e-9)):
+                head = max(span * 0.15, 1.0)
+                self.ax_iq.set_ylim(data_lo - head, data_hi + head)
+                self.iq_ylim = (data_lo - head, data_hi + head)
+                need_full = True
 
+        # Blitting: full-redraw nền (KHÔNG gồm 2 line animated) chỉ khi cần, rồi
+        # khôi phục nền + vẽ riêng 2 line + blit. Lỗi bất kỳ -> fallback draw_idle.
         try:
-            self.canvas_iq.draw_idle()
+            if need_full:
+                self.canvas_iq.draw()
+                self.iq_bg = self.canvas_iq.copy_from_bbox(self.ax_iq.bbox)
+            self.canvas_iq.restore_region(self.iq_bg)
+            self.ax_iq.draw_artist(self.i_line)
+            self.ax_iq.draw_artist(self.q_line)
+            self.canvas_iq.blit(self.ax_iq.bbox)
         except Exception:
-            pass
+            try:
+                self.iq_bg = None
+                self.canvas_iq.draw_idle()
+            except Exception:
+                pass
 
     def _update_plots(self, rp: dict):
         profile = np.asarray(rp.get("range_profile") or [], dtype=float)
