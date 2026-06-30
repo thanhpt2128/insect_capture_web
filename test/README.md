@@ -1,0 +1,44 @@
+# test/ — Kiểm thử & benchmark pipeline realtime AI
+
+Bộ test/benchmark cho luồng GUI realtime ([`realtime_gui.py`](../realtime_gui.py) →
+[`realTimeProc_infer.py`](../realTimeProc_infer.py)). **Không cần phần cứng** — dùng
+dữ liệu raw thật trong `data_parse/` và model thật trong
+`insect_radar_processor/models/`.
+
+## Chạy
+
+```powershell
+# từ thư mục gốc repo, dùng python của venv
+.venv\Scripts\python.exe test\run_all.py            # chạy toàn bộ test correctness
+.venv\Scripts\python.exe test\test_drop_oldest_queue.py
+.venv\Scripts\python.exe test\test_pipeline_functional.py
+.venv\Scripts\python.exe test\bench_dsp_inference.py
+.venv\Scripts\python.exe test\bench_queue.py
+```
+
+> Trên Windows nên đặt `PYTHONUTF8=1` để console in được ký tự Unicode:
+> `$env:PYTHONUTF8=1; .venv\Scripts\python.exe test\run_all.py`
+
+## Các file
+
+| File | Loại | Nội dung |
+|------|------|----------|
+| `test_drop_oldest_queue.py` | correctness | FIFO, bounded, không reorder, **drop-oldest đúng 100%** (single-proc burst + cross-proc bão hòa payload 16MB). Exit 1 nếu FAIL. |
+| `test_pipeline_functional.py` | correctness | Alignment 58 feature, schema `process_complex`, tương đương IQ order QQII↔IIQQ, hình học cfg=131072, smoke inference svm. |
+| `bench_dsp_inference.py` | benchmark | Thời gian từng tầng P1/P2/P3 + soak 150 lô (rò rỉ RAM, trôi độ trễ) + kết luận ngân sách thời gian thực. |
+| `bench_queue.py` | benchmark | Thông lượng put (payload nhỏ & 16MB) + độ trễ cross-process (chế độ thật & bão hòa). |
+| `GUI_CODE_QUALITY.md` | đánh giá | Phân tích chất lượng luồng code GUI: điểm tốt + điểm cần cải thiện. |
+| `run_all.py` | runner | Chạy lần lượt các file *correctness*, tổng hợp PASS/FAIL. |
+
+## Kết quả tham chiếu (máy dev, Python 3.12)
+
+- DSP `process_complex`: ~154 ms/lô (p95 167) ≪ ngân sách 600 ms@50fps → **bắt kịp**.
+- Inference: svm 0.7 ms · rf 79 ms · xgb **không load được** (chưa cài `xgboost`).
+- Soak 150 lô: **không rò rỉ RAM, không trôi độ trễ**.
+- DropOldestQueue (sau fix): **giữ phần tử mới nhất 100%** mọi kịch bản, kể cả
+  payload 16MB cross-process (trước fix: 0%).
+
+## Phụ thuộc
+
+`numpy scipy scikit-learn joblib` (bắt buộc), `psutil` (tùy chọn, cho phần đo RAM).
+Cài `xgboost` nếu muốn benchmark/inference model xgb.

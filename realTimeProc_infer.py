@@ -377,7 +377,17 @@ def _build_iq_plot(
 
 
 class DropOldestQueue:
-    """Bounded multiprocessing queue that drops stale items instead of blocking."""
+    """Bounded multiprocessing queue that drops the OLDEST item when full.
+
+    When full, putting a new item evicts the oldest buffered item so the most
+    recent data is always retained (drop-oldest), keeping latency low for the
+    realtime pipeline. Never blocks the producer beyond the eviction step.
+    """
+
+    # Safety cap for the eviction wait. The feeder flushes in well under this,
+    # so it never actually elapses in practice — it only bounds a pathological
+    # stall instead of blocking the producer forever.
+    _EVICT_TIMEOUT_S = 1.0
 
     def __init__(self, maxsize: int):
         self.queue = multiprocessing.Queue(maxsize=maxsize)
@@ -391,8 +401,16 @@ class DropOldestQueue:
             except Full:
                 pass
 
+            # Full: evict the oldest item to make room for the newest one.
+            # multiprocessing.Queue buffers puts in a background feeder thread,
+            # so a just-put item may not have reached the pipe yet. A
+            # get(block=False) here would then raise Empty and the eviction
+            # would silently fail, dropping the NEW item instead of the old one
+            # (drop-newest — the opposite of intent). A short *blocking* get
+            # waits for the feeder to flush one item, so the OLDEST is reliably
+            # removed. Verified 100% drop-oldest in test/test_drop_oldest_queue.py.
             try:
-                self.queue.get(block=False)
+                self.queue.get(timeout=self._EVICT_TIMEOUT_S)
             except Empty:
                 pass
 
