@@ -28,6 +28,7 @@ dữ liệu raw thật trong `data_parse/` và model thật trong
 | `bench_dsp_inference.py` | benchmark | Thời gian từng tầng P1/P2/P3 + soak 150 lô (rò rỉ RAM, trôi độ trễ) + kết luận ngân sách thời gian thực. |
 | `bench_queue.py` | benchmark | Thông lượng put (payload nhỏ & 16MB) + độ trễ cross-process (chế độ thật & bão hòa). |
 | `bench_iq_fps.py` | benchmark | FPS thực tế panel I/Q (TkAgg): so cũ (full draw 4096) vs mới (blitting + downsample 1024). |
+| `bench_end_to_end_latency.py` | benchmark | Mô phỏng cross-process P1->P2->P3 thật (nhịp @50fps), đo đúng 2 số GUI hiển thị: `dsp_ms` ("DSP") vs `proc_ms` ("Trễ xử lý"). |
 | `GUI_CODE_QUALITY.md` | đánh giá | Phân tích chất lượng luồng code GUI: điểm tốt + điểm cần cải thiện. |
 | `run_all.py` | runner | Chạy lần lượt các file *correctness*, tổng hợp PASS/FAIL. |
 
