@@ -100,7 +100,8 @@ class RealtimeController:
     def is_running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, com: str, cfg: str, baud: int, numframes: int, model: str) -> None:
+    def start(self, com: str, cfg: str, baud: int, numframes: int, model: str,
+              stride: int = 0) -> None:
         if self.is_running():
             return
         if not WORKER.exists():
@@ -118,6 +119,7 @@ class RealtimeController:
             "--server-host", str(host), "--server-port", str(port),
             "--com-port", com, "--cli-baud", str(baud),
             "--cfg-path", cfg, "--numframes", str(numframes),
+            "--stride", str(stride),
             "--model", model, "--no-local-view", "--no-profile",
         ]
         self.log_q.put(">>> " + " ".join(cmd))
@@ -246,6 +248,7 @@ class App:
         self.cfg_var = StringVar()
         self.baud_var = StringVar(value="921600")
         self.numframes_var = StringVar(value="30")
+        self.stride_var = StringVar(value="0")   # 0 = tumbling (đủ 30 frame mới xử lý); <30 = cửa sổ trượt
         self.model_var = StringVar(value="svm")
         self.status_var = StringVar(value="Idle")
         self.result_var = StringVar(value="—")
@@ -284,6 +287,10 @@ class App:
         ttk.Label(top, text="Model").grid(row=1, column=5, sticky=W, pady=(6, 0))
         ttk.Combobox(top, textvariable=self.model_var, values=["svm", "rf", "xgb"], width=6,
                      state="readonly").grid(row=1, column=6, sticky=W, padx=4, pady=(6, 0))
+        ttk.Label(top, text="Stride").grid(row=1, column=7, sticky=W, pady=(6, 0), padx=(16, 0))
+        ttk.Entry(top, textvariable=self.stride_var, width=6).grid(row=1, column=8, sticky=W, padx=4, pady=(6, 0))
+        ttk.Label(top, text="(0 = đủ 30 frame; <30 = cửa sổ trượt)", foreground="#888").grid(
+            row=1, column=9, sticky=W, padx=(4, 0), pady=(6, 0))
 
         btns = ttk.Frame(top)
         btns.grid(row=2, column=0, columnspan=7, sticky=W, pady=(8, 0))
@@ -417,14 +424,21 @@ class App:
         try:
             baud = int(self.baud_var.get())
             numframes = int(self.numframes_var.get())
+            stride = int(self.stride_var.get())
         except ValueError:
-            messagebox.showerror("Sai tham số", "Baud và numframes phải là số.")
+            messagebox.showerror("Sai tham số", "Baud, numframes và Stride phải là số.")
+            return
+        if stride > numframes:
+            messagebox.showerror(
+                "Stride không hợp lệ",
+                f"Stride ({stride}) không được lớn hơn numframes ({numframes}).\n"
+                "Đặt 0 để xử lý theo lô đầy (không chồng lấp).")
             return
 
         cfg_path = str((CONFIG_DIR / cfg).resolve())
         self._reset_plots()
         try:
-            self.ctrl.start(com, cfg_path, baud, numframes, self.model_var.get())
+            self.ctrl.start(com, cfg_path, baud, numframes, self.model_var.get(), stride)
         except Exception as exc:
             messagebox.showerror("Không chạy được", str(exc))
             return

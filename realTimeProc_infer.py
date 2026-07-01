@@ -484,12 +484,18 @@ def capture_worker_process(
 
         dca.stream_start()
         batch_frames = max(1, int(args_dict["numframes"]))
+        # Sliding-window stride: số frame MỚI cần nhận trước khi phát cửa sổ kế.
+        # = batch_frames -> tumbling (không chồng lấp); < batch_frames -> chồng lấp.
+        stride = int(args_dict.get("stride", 0) or 0)
+        if stride <= 0 or stride > batch_frames:
+            stride = batch_frames
         max_buffer_size = max(int(args_dict["frame_num_in_buf"]), batch_frames)
         dca.fastRead_in_Cpp_thread_start(max_buffer_size)
         radar.startSensor()
         print("[+] Hardware started. Capturing UDP data...", flush=True)
         log_event("CAPTURE_START",
-                  f"com={args_dict['com_port']}; get_numframes=1; batch_frames={batch_frames}")
+                  f"com={args_dict['com_port']}; get_numframes=1; "
+                  f"batch_frames={batch_frames}; stride={stride}")
 
         frame_seq = 0
         batch_seq = 0
@@ -548,7 +554,10 @@ def capture_worker_process(
                         np.complex64,
                         copy=False,
                     )
-                    del iq_batch[:batch_frames]
+                    # Trượt cửa sổ đi 'stride' frame: chỉ bỏ 'stride' frame cũ nhất,
+                    # giữ (batch_frames - stride) frame đuôi để ghép với frame mới cho
+                    # cửa sổ kế. stride == batch_frames -> bỏ hết (tumbling, như cũ).
+                    del iq_batch[:stride]
                     preprocess_queue.put((batch_seq, time.time(), batch_iq, "complex"))
                     put_ms = (time.perf_counter() - _t1) * 1000.0
                     queued_batch = True
@@ -1181,6 +1190,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cfg-path", type=str, required=True)
     parser.add_argument("--dca-cfg", type=str, default="cf.json")
     parser.add_argument("--numframes", type=int, default=30)
+    parser.add_argument("--stride", type=int, default=0,
+                        help="Sliding-window stride (số frame MỚI giữa 2 cửa sổ DSP "
+                             "liên tiếp). Mặc định 0 -> = numframes (tumbling, không "
+                             "chồng lấp, hành vi cũ). Đặt < numframes để cửa sổ chồng "
+                             "lấp: giảm trễ phát hiện, đổi lại DSP chạy dày hơn. Ví dụ "
+                             "numframes=30 stride=15 -> chồng lấp 50%%, ra kết quả mỗi 15 frame.")
     parser.add_argument("--frame-num-in-buf", type=int, default=256)
     # 0 = no artificial pacing; the client coalesces draws via requestAnimationFrame,
     # so a server-side sleep only adds latency and backlog.
@@ -1215,6 +1230,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     args_dict["com_port"] = (args_dict["com_port"] or "").strip()
     args_dict["cfg_path"] = _resolve_repo_path(str(args_dict["cfg_path"]), default_dir="configFiles")
     args_dict["dca_cfg"] = _resolve_repo_path(str(args_dict["dca_cfg"]), default_dir="configFiles")
+
+    # Resolve sliding-window stride: 0/âm hoặc > numframes -> = numframes (tumbling).
+    # 1 <= stride <= numframes: cửa sổ trượt, chồng lấp (numframes - stride) frame.
+    _nf = max(1, int(args_dict["numframes"]))
+    _stride = int(args_dict.get("stride", 0) or 0)
+    if _stride <= 0 or _stride > _nf:
+        _stride = _nf
+    args_dict["stride"] = _stride
+    if _stride < _nf:
+        print(f"[*] Sliding window: numframes={_nf}, stride={_stride} "
+              f"(chồng lấp {_nf - _stride} frame; kết quả mỗi {_stride} frame).", flush=True)
 
     multiprocessing.freeze_support()
 

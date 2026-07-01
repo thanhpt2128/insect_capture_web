@@ -25,10 +25,12 @@ dữ liệu raw thật trong `data_parse/` và model thật trong
 |------|------|----------|
 | `test_drop_oldest_queue.py` | correctness | FIFO, bounded, không reorder, **drop-oldest đúng 100%** (single-proc burst + cross-proc bão hòa payload 16MB). Exit 1 nếu FAIL. |
 | `test_pipeline_functional.py` | correctness | Alignment 58 feature, schema `process_complex`, tương đương IQ order QQII↔IIQQ, hình học cfg=131072, smoke inference svm. |
+| `test_sliding_window.py` | correctness | Logic cửa sổ trượt `--stride`: kích thước cửa sổ, bước trượt, chồng lấp, tumbling mặc định, quy tắc resolve. |
 | `bench_dsp_inference.py` | benchmark | Thời gian từng tầng P1/P2/P3 + soak 150 lô (rò rỉ RAM, trôi độ trễ) + kết luận ngân sách thời gian thực. |
 | `bench_queue.py` | benchmark | Thông lượng put (payload nhỏ & 16MB) + độ trễ cross-process (chế độ thật & bão hòa). |
 | `bench_iq_fps.py` | benchmark | FPS thực tế panel I/Q (TkAgg): so cũ (full draw 4096) vs mới (blitting + downsample 1024). |
 | `bench_end_to_end_latency.py` | benchmark | Mô phỏng cross-process P1->P2->P3 thật (nhịp @50fps), đo đúng 2 số GUI hiển thị: `dsp_ms` ("DSP") vs `proc_ms` ("Trễ xử lý"). |
+| `bench_sliding_stride.py` | benchmark | So cửa sổ trượt stride 30/20/15 @60fps: dsp_ms, proc_ms, nhịp kết quả, backlog/drop, tải P2, độ trễ phát hiện tổng (gather + proc). |
 | `GUI_CODE_QUALITY.md` | đánh giá | Phân tích chất lượng luồng code GUI: điểm tốt + điểm cần cải thiện. |
 | `run_all.py` | runner | Chạy lần lượt các file *correctness*, tổng hợp PASS/FAIL. |
 

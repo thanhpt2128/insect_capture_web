@@ -15,6 +15,7 @@ HERE = Path(__file__).resolve().parent
 CORRECTNESS = [
     "test_drop_oldest_queue.py",
     "test_pipeline_functional.py",
+    "test_sliding_window.py",
 ]
 
 
