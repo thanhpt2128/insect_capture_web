@@ -16,6 +16,8 @@ CORRECTNESS = [
     "test_drop_oldest_queue.py",
     "test_pipeline_functional.py",
     "test_sliding_window.py",
+    "test_database.py",
+    "test_receive_module.py",
 ]
 
 
